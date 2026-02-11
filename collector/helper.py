@@ -15,6 +15,7 @@ import traceback
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+import csv
 
 # Exit codes
 EXIT_CODE_RESTART = 10  # Exit code to indicate restart is needed
@@ -262,6 +263,9 @@ def benchmark_with_power(
                 raise
     else:
         use_graph = False
+        if torch.xpu.is_available():  # run op in torch.compile mode
+            compiled_op = torch.compile(kernel_func, options={"freezing": True})
+            torch.xpu.synchronize()
 
     # ═══════════════════════════════════════════════════════════════════
     # Warmup the ACTUAL execution path (after graph capture)
@@ -276,6 +280,11 @@ def benchmark_with_power(
                 for _ in range(repeat_n):
                     kernel_func()
         torch.cuda.synchronize()
+    elif torch.xpu.is_available():
+        torch.xpu.synchronize()
+        for _ in range(num_warmups):
+            _ = compiled_op()
+        torch.xpu.synchronize()
 
     # Initialize power monitor if enabled
     power_monitor = None
@@ -319,7 +328,7 @@ def benchmark_with_power(
         end_event = torch.xpu.Event(enable_timing=True)
         start_event.record()
         for i in range(actual_num_runs):
-            kernel_func()
+            _ = compiled_op()
         end_event.record()
         torch.xpu.synchronize()
 
@@ -645,34 +654,59 @@ def log_perf(
     perf_filename: str,
     power_stats: dict | None = None,  # NEW PARAMETER
 ):
-    """
-    Log performance data to a CSV file with file locking.
+    lock_file = perf_filename + ".lock"
 
-    WARNING: fcntl.flock() advisory locks do NOT work reliably on NFS/shared
-    filesystems. If your output file is on NFS, workers may deadlock.
-    Use local filesystem paths (e.g., /tmp/) for output files instead.
-    """
-    content_prefix = f"{framework},{version},{device_name},{op_name},{kernel_source}"
-    header_prefix = "framework,version,device,op_name,kernel_source"
-    for item in item_list:
-        for key, value in item.items():
-            content_prefix += f",{value}"
-            header_prefix += f",{key}"
+    # Try for 1 seconds (10 attempts * 0.1s)
+    got_lock = False
+    for _ in range(10):
+        try:
+            # "Create this file, but fail if it exists" (Atomic & NFS safe)
+            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            got_lock = True
+            break
+        except OSError:
+            time.sleep(0.1)
 
-    # Add power stats only if power measurement was enabled
-    if power_stats:
-        for key in ["power", "power_limit"]:
-            value = power_stats.get(key, "")
-            content_prefix += f",{value}"
-            header_prefix += f",{key}"
+    if not got_lock:
+        print(f"Skipping log: Could not get lock for {perf_filename}")
+        # Optional: Force delete lock_file here
+        return
 
-    with open(perf_filename, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    try:
+        with open(perf_filename, "a", newline="") as f:
+            # Add header only if file is empty
+            is_empty = os.fstat(f.fileno()).st_size == 0
 
-        if os.fstat(f.fileno()).st_size == 0:
-            f.write(header_prefix + "\n")
+            base_data = {
+                "framework": framework, "version": version,
+                "device": device_name, "op_name": op_name,
+                "kernel_source": kernel_source
+            }
 
-        f.write(content_prefix + "\n")
+            # Get headers from first item if exists
+            fieldnames = list(base_data.keys())
+            if item_list:
+                fieldnames += list(item_list[0].keys())
+
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+
+            if is_empty:
+                writer.writeheader()
+
+            for item in item_list:
+                writer.writerow(base_data | item)
+
+            # FORCE DISK WRITE (Crucial for NFS)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception as e:
+        print(f"Error writing log: {e}")
+    finally:
+        # --- 3. RELEASE ---
+        # Always delete the lock file, even if writing crashed
+        if got_lock and os.path.exists(lock_file):
+            os.unlink(lock_file)
 
 
 # Helper functions for MoE

@@ -4,7 +4,7 @@
 import os
 
 import torch
-from vllm.config import VllmConfig, set_current_vllm_config
+# from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
@@ -19,7 +19,7 @@ from vllm.version import __version__ as vllm_version
 
 from collector.common_test_cases import get_gemm_common_test_cases
 from collector.helper import benchmark_with_power, get_sm_version, log_perf
-from collector.vllm.utils import setup_distributed, with_exit_stack
+from collector.vllm.utils import setup_distributed  #, with_exit_stack
 
 compatible_versions = ["0.11.0", "0.12.0", "0.14.0"]
 
@@ -62,8 +62,8 @@ def get_gemm_test_cases():
     return test_cases
 
 
-@with_exit_stack
-def run_gemm(exit_stack, gemm_type, m, n, k, perf_filename, device="cuda:0"):
+# @with_exit_stack
+def run_gemm(gemm_type, m, n, k, perf_filename, device="cuda:0"):
     # Force DeepGEMM path when available to capture the intended kernel.
     os.environ["VLLM_USE_DEEP_GEMM"] = "1"
 
@@ -75,9 +75,9 @@ def run_gemm(exit_stack, gemm_type, m, n, k, perf_filename, device="cuda:0"):
         torch.cuda.set_device(device)
     elif torch.xpu.is_available():
         torch.xpu.set_device(device)
-    torch.set_default_device(device)
+    # torch.set_default_device(device)
 
-    x = torch.randn((m, k), dtype=dtype, device=torch.device(device))
+    x = torch.randn((m, k), dtype=dtype, device=device) # device is already an instance
 
     if gemm_type == "fp8":
         qc = Fp8Config(
@@ -108,7 +108,7 @@ def run_gemm(exit_stack, gemm_type, m, n, k, perf_filename, device="cuda:0"):
             disable_tp=True,
         )
         # TODO, to evaluate random weights impact
-        gemm.to(torch.device(device))
+        gemm.to(device=device)
 
         if gemm_type == "fp8" and hasattr(gemm, "weight"):
             new_weight = gemm.weight.data.t()
@@ -142,16 +142,40 @@ def run_gemm(exit_stack, gemm_type, m, n, k, perf_filename, device="cuda:0"):
 
         return gemm
 
-    exit_stack.enter_context(set_current_vllm_config(VllmConfig()))
+    # exit_stack.enter_context(set_current_vllm_config(VllmConfig()))
 
     outside_loop_count = 6
+    # calculate num of gemm to put into one graph for xpu
+    if torch.xpu.is_available():
+        num_bytes_per_dtype = 1 if gemm_type=='fp8' or gemm_type=='fp8_block' else 2
+        mem_one_gemm = num_bytes_per_dtype*(m*k + k*n + m*n)
+        max_num_gemm = (4*1024*1024*1024)//mem_one_gemm  # 4GB
+        if max_num_gemm > 1000:
+            outside_loop_count = 300
+        elif max_num_gemm > 500:
+            outside_loop_count = 200
+        elif max_num_gemm > 200:
+            outside_loop_count = 100
+        elif max_num_gemm > 100:
+            outside_loop_count = 60
+        elif max_num_gemm > 50:
+            outside_loop_count = 30
+        elif max_num_gemm > 25:
+            outside_loop_count = 20
+        elif max_num_gemm > 15:
+            outside_loop_count = 10
+        else:
+            outside_loop_count = 6
+
     op_list = []
     for i in range(outside_loop_count):
         op_list.append(create_gemm())
 
     def kernel_func():
+        result = []
         for op in op_list:
-            op.forward(x)
+            result.append(op.forward(x))
+        return result
 
     with benchmark_with_power(
         device=device,
@@ -161,6 +185,15 @@ def run_gemm(exit_stack, gemm_type, m, n, k, perf_filename, device="cuda:0"):
         repeat_n=1,
     ) as results:
         pass
+
+    # clean up cache for xpu
+    if torch.xpu.is_available():
+        del x
+        for op in op_list:
+            if hasattr(op, 'weight'):
+                del op.weight
+            del op
+        torch.compiler.reset()
 
     log_perf(
         item_list=[
