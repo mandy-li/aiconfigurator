@@ -19,12 +19,14 @@ node:
   pcie_bw: 32000000000  # Byte/s, single direction, pcie 5.0 (4GB/s) x8 (8 lane for b60)
   p2p_latency: 0.00001  # 10us some nonofficial correction based on observations, you should try to modify based on your own observations
 
-# TODO fix this with oneccl, use for memory usage computation
+# oneCCL comm library memory overhead, reusing NCCL estimates for now.
+# TODO: measure actual oneCCL memory footprint on XPU and update.
 misc:
-  nccl_mem: # some nonofficial correction based on observations, you should try to modify based on your own observations
+  nccl_mem: # comm library memory overhead per GPU count
     1: 0
     2: 358612992 # 342MB
     4: 411041792 # 392MB
     8: 411041792 # 392MB
   other_mem: 3758096384 # increase from 551MB to 3.5GB for safer deployment, this will cover part of the inaccurate mem calc.
   nccl_version: '2.23'
+  oneccl_version: '2021.17.2'

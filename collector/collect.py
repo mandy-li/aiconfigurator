@@ -916,10 +916,11 @@ def _all_op_names() -> list[str]:
     from collector.sglang.registry import REGISTRY as SGLANG_REG
     from collector.trtllm.registry import REGISTRY as TRTLLM_REG
     from collector.vllm.registry import REGISTRY as VLLM_REG
+    from collector.vllm.registry import REGISTRY_XPU as VLLM_XPU_REG
 
     seen = set()
     ops = []
-    for reg in (TRTLLM_REG, VLLM_REG, SGLANG_REG):
+    for reg in (TRTLLM_REG, VLLM_REG, VLLM_XPU_REG, SGLANG_REG):
         for entry in reg:
             if entry.op not in seen:
                 seen.add(entry.op)
