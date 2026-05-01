@@ -20,6 +20,7 @@ Three picking modes are supported:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Literal
 
 import pandas as pd
@@ -33,9 +34,119 @@ _RATE_MATCHING_PREFILL_DEGRADATION_FACTOR = 0.9
 # comes from not saturating the batchsize slot of decode worker
 _RATE_MATCHING_DECODE_DEGRADATION_FACTOR = 0.92
 
-# TTFT correction for concurrent prefill queueing: with N=10 batches and
-# local concurrency lc=15-20, formula lc/20+0.95 gives ~1.8
+# TTFT correction for concurrent prefill queueing in disagg serving.
+#
+# In disagg, prefill and decode run on SEPARATE GPUs.  The prefill engine
+# processes requests sequentially.  With a benchmark using
+# max_concurrency = C (new request submitted when a previous one fully
+# completes), the prefill queue behaviour depends on the ratio:
+#
+#   R = T_decode / T_prefill   (how many prefills fit in one decode time)
+#
+# where T_decode = tpot * (osl - 1) and T_prefill = raw prefill ttft.
+#
+# Two regimes:
+#   C <= R: After the initial burst, the queue drains before decodes finish.
+#           Steady-state TTFT = T_prefill (no queueing).  Multiplier = 1.
+#   C >  R: Queue never fully drains; steady-state queue depth = C - R.
+#           Steady-state TTFT = (C - R) * T_prefill.  Multiplier = C - R.
+#
+# We report the steady-state multiplier since it represents the TTFT most
+# requests will experience in a continuous workload.
+#
+# Old fixed factor (lc=17, N=10) = 1.8 is kept for backward compat only.
 _AUTOSCALE_TTFT_CORRECTION_FACTOR = 1.8
+
+# Set this env var to "true" or "1" to enable the new queueing-aware
+# TTFT correction model.  When unset or "false"/"0", the old fixed 1.8x
+# factor is used.
+_TTFT_QUEUEING_MODEL_ENV = "AICONFIG_TTFT_QUEUE_MODEL"
+
+# Number of request iterations (waves) in the benchmark.  genai-perf default
+# is N_total = 10 * C, so each concurrency level sees ~10 waves.  The
+# first-wave burst is diluted over this many waves when computing the
+# mean TTFT correction.  Default: 10.
+_TTFT_NUM_REQUEST_ITERS_ENV = "AICONFIG_TTFT_NUM_REQUEST_ITERS"
+_TTFT_NUM_REQUEST_ITERS_DEFAULT = 10
+
+
+def compute_ttft_correction_factor(
+    decode_concurrency: int,
+    prefill_num_worker: int = 1,
+    t_decode_ms: float = 0.0,
+    t_prefill_ms: float = 0.0,
+    prefill_bs: int = 1,
+) -> float:
+    """Compute TTFT correction factor for disagg serving.
+
+    When ``AICONFIG_TTFT_QUEUE_MODEL`` env var is **not** set,
+    returns the legacy fixed factor (1.8).
+
+    When the env var **is** set, uses a queueing model that accounts for
+    prefill batch size and number of request iterations (waves).  In disagg
+    with a max-concurrency benchmark:
+
+    - C requests are in flight; when one fully completes (decode done),
+      a replacement enters the prefill queue.
+    - The prefill engine processes ``B = prefill_bs`` requests every
+      ``T_prefill`` ms, giving an effective drain capacity per worker of
+      ``R_eff = B * T_decode / T_prefill``.
+    - If ``C/P > R_eff``  the queue never drains; steady-state correction
+      is ``1 + (C/P - R_eff) / B``.
+    - Otherwise the queue drains between decode cycles; only the first
+      wave experiences a burst.  Diluted over ``num_request_iters`` waves:
+      ``1 + (lc/B - 1) / (2 * num_request_iters)``.
+
+    ``AICONFIG_TTFT_NUM_REQUEST_ITERS`` env var controls number of waves
+    (default 10, matching genai-perf convention of N_total = 10 * C).
+
+    Args:
+        decode_concurrency: Total decode concurrency (decode_bs * decode_workers).
+        prefill_num_worker: Number of prefill workers sharing the load.
+        t_decode_ms: Total decode time per request (tpot * (osl - 1)).
+        t_prefill_ms: Single-request prefill time (ttft from DataFrame).
+        prefill_bs: Prefill batch size (requests processed per T_prefill).
+
+    Returns:
+        Multiplicative correction factor (>= 1.0).
+    """
+    if os.environ.get(_TTFT_QUEUEING_MODEL_ENV, "1").lower() not in ("true", "1"):
+        return _AUTOSCALE_TTFT_CORRECTION_FACTOR
+
+    P = max(prefill_num_worker, 1)
+    B = max(prefill_bs, 1)
+    C = decode_concurrency
+    lc = C / P  # load per prefill worker
+
+    # Number of request iterations (waves) — controls first-wave dilution.
+    try:
+        num_request_iters = int(os.environ.get(_TTFT_NUM_REQUEST_ITERS_ENV, _TTFT_NUM_REQUEST_ITERS_DEFAULT))
+    except (ValueError, TypeError):
+        num_request_iters = _TTFT_NUM_REQUEST_ITERS_DEFAULT
+    num_request_iters = max(num_request_iters, 1)
+
+    if t_prefill_ms > 0 and t_decode_ms > 0:
+        # R_eff: how many requests one prefill worker can drain during
+        # one decode cycle (B requests every T_prefill interval).
+        # Inflate T_decode by 15% to compensate for possible TPOT
+        # underestimation, which gives the prefill queue more drain time.
+        R_eff = 1.15 * B * t_decode_ms / t_prefill_ms
+        if lc > R_eff:
+            # Heavy queueing: queue depth stabilises at lc - R_eff.
+            # First wave sees burst, subsequent waves see steady state.
+            first_wave = (lc / B + 1) / 2
+            steady_state = 1.0 + (lc - R_eff) / B
+            factor = (first_wave + (num_request_iters - 1) * steady_state) / num_request_iters
+        else:
+            # Queue drains after initial burst.  Only the first wave
+            # experiences queueing; dilute over num_request_iters waves.
+            # Base of 1.15 (add 15% buffer to account for other variability)
+            factor = 1.15 + (lc / B - 1) / (2 * num_request_iters)
+    else:
+        # Fallback: burst model (conservative)
+        factor = 1.1 + (lc / B - 1) / (2 * num_request_iters)
+
+    return max(factor, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -421,22 +532,22 @@ def pick_autoscale(
     if prefill_df is None or prefill_df.empty or decode_df is None or decode_df.empty:
         return empty_result
 
-    correction_factor = _AUTOSCALE_TTFT_CORRECTION_FACTOR
-
-    # -- Filter prefill candidates by TTFT --
+    # -- Pre-filter prefill candidates (use max possible correction for SLA check) --
+    # The actual correction depends on decode concurrency and T_decode/T_prefill,
+    # which varies per combo. For the initial filter, use correction=1 (no queueing)
+    # so we don't discard prefill candidates prematurely.
     prefill_candidates = prefill_df.copy()
-    prefill_candidates["ttft_corrected"] = prefill_candidates["ttft"] * correction_factor
-    prefill_meets_sla = prefill_candidates[prefill_candidates["ttft_corrected"] < target_ttft]
+    prefill_candidates["ttft_min_corrected"] = prefill_candidates["ttft"]  # no correction for pre-filter
+    prefill_meets_sla = prefill_candidates[prefill_candidates["ttft_min_corrected"] < target_ttft]
 
     if prefill_meets_sla.empty:
         logger.warning(
-            "pick_autoscale: no prefill candidates meet TTFT < %sms (after %.1fx correction). "
+            "pick_autoscale: no prefill candidates meet TTFT < %sms. "
             "Returning closest matches.",
             target_ttft,
-            correction_factor,
         )
         prefill_candidates = (
-            prefill_candidates.sort_values(by=["ttft_corrected", "seq/s/gpu"], ascending=[True, False])
+            prefill_candidates.sort_values(by=["ttft_min_corrected", "seq/s/gpu"], ascending=[True, False])
             .drop_duplicates(subset=["parallel"], keep="first")
             .head(top_n)
             .reset_index(drop=True)
@@ -475,9 +586,32 @@ def pick_autoscale(
     # -- Combine: each prefill x each decode, workers=1, take top_n --
     all_combos: list[dict] = []
     for _, p_row in prefill_candidates.iterrows():
-        p_dict = p_row.to_dict()
-        p_dict["ttft"] = p_row["ttft_corrected"]
+        t_prefill = float(p_row["ttft"])
         for _, d_row in decode_candidates.iterrows():
+            decode_concurrency = int(d_row.get("bs", 1))
+            osl = int(d_row.get("osl", p_row.get("osl", 1)))
+            tpot = float(d_row.get("tpot", 0))
+            t_decode = tpot * max(osl - 1, 0)
+            prefill_bs = int(p_row.get("bs", 1))
+            correction = compute_ttft_correction_factor(
+                decode_concurrency, prefill_num_worker=1,
+                t_decode_ms=t_decode, t_prefill_ms=t_prefill,
+                prefill_bs=prefill_bs,
+            )
+            p_dict = p_row.to_dict()
+            p_dict["ttft"] = t_prefill * correction
+            logger.debug(
+                "pick_autoscale: prefill %s bs=%d + decode %s bs=%d → "
+                "TTFT correction=%.2fx (C=%d, R=%.1f), corrected_ttft=%.1fms",
+                p_row.get("parallel", ""),
+                int(p_row.get("bs", 0)),
+                d_row.get("parallel", ""),
+                decode_concurrency,
+                correction,
+                decode_concurrency,
+                t_decode / t_prefill if t_prefill > 0 else 0,
+                p_dict["ttft"],
+            )
             combo = _build_disagg_summary_dict(
                 prefill_summary_dict=p_dict,
                 prefill_num_worker=1,

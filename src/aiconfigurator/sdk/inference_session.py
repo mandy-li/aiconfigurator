@@ -14,6 +14,7 @@ from aiconfigurator.sdk.errors import NoFeasibleConfigError
 from aiconfigurator.sdk.inference_summary import InferenceSummary
 from aiconfigurator.sdk.picking import (
     _AUTOSCALE_TTFT_CORRECTION_FACTOR,
+    compute_ttft_correction_factor,
     _RATE_MATCHING_DECODE_DEGRADATION_FACTOR,
     _RATE_MATCHING_PREFILL_DEGRADATION_FACTOR,
     _build_disagg_summary_dict,
@@ -245,8 +246,19 @@ class DisaggInferenceSession:
         Get the disagg summary df based on prefill and decode summary df
         """
         prefill_dict = prefill_summary_df.iloc[0].to_dict()
-        prefill_dict["ttft"] = prefill_dict["ttft"] * _AUTOSCALE_TTFT_CORRECTION_FACTOR
         decode_dict = decode_summary_df.iloc[0].to_dict()
+        decode_concurrency = int(decode_dict.get("bs", 1)) * decode_num_worker
+        t_prefill = float(prefill_dict.get("ttft", 0))
+        tpot = float(decode_dict.get("tpot", 0))
+        osl = int(decode_dict.get("osl", prefill_dict.get("osl", 1)))
+        t_decode = tpot * max(osl - 1, 0)
+        prefill_bs = int(prefill_dict.get("bs", 1))
+        ttft_correction = compute_ttft_correction_factor(
+            decode_concurrency, prefill_num_worker,
+            t_decode_ms=t_decode, t_prefill_ms=t_prefill,
+            prefill_bs=prefill_bs,
+        )
+        prefill_dict["ttft"] = prefill_dict["ttft"] * ttft_correction
 
         summary_dict = _build_disagg_summary_dict(
             prefill_dict,
@@ -646,13 +658,16 @@ class DisaggInferenceSession:
             #    "1.x" is an empirical value. Default is 1.1.
 
             # only ttft will be corrected here, other latency and throughput will not be
-            # corrected. concurrency / num_prefill_workers = local_concurrency(lc);
-            # N x concurrency requests. formula = (lc * (lc+1) / 2 + lc * (N-1) )/lc/N
-            # if we use N=10, it's lc/20+0.95. assume lc can be 15-20, 1.8 is a reasonable
-            # correction factor. as we need to get the lc after rate matching, we cannot get the
-            # exact value now. Let's make it simple to do pre-correction instead of post-correction.
-            correction_factor = _AUTOSCALE_TTFT_CORRECTION_FACTOR
-            prefill_candidates = prefill_summary_df.assign(ttft=prefill_summary_df["ttft"] * correction_factor)
+            # corrected. The correction depends on decode concurrency and prefill workers.
+            # With decode_bs = C and prefill_workers = P, local concurrency lc = C/P.
+            # For N waves: avg TTFT multiplier = (lc+1)/(2N) + (N-1)/N.
+            # The correction is applied per (prefill, decode) combo in the loop below
+            # since it depends on decode_bs and prefill_num_worker from rate matching.
+            # For the initial SLA filter, use no correction (correction=1)
+            # to avoid discarding prefill candidates prematurely.
+            # The actual per-combo correction is computed in the inner loop.
+            prefill_candidates = prefill_summary_df.copy()
+            prefill_candidates["ttft_uncorrected"] = prefill_candidates["ttft"]
 
             prefill_candidates = prefill_candidates[prefill_candidates["ttft"] < ttft]
             if len(prefill_candidates) == 0:
@@ -687,6 +702,7 @@ class DisaggInferenceSession:
                 for decode_worker in decode_workers_list:
                     decode_throughput = float(decode_worker["seq/s"])
                     decode_gpus = decode_worker["num_total_gpus"]
+                    decode_bs = int(decode_worker.get("bs", 1))
                     for prefill_worker in prefill_candidates_list:
                         # For SGLang non-wideep disaggregated serving
                         # See: https://github.com/ai-dynamo/dynamo/issues/5870
@@ -705,8 +721,23 @@ class DisaggInferenceSession:
                         if prefill_num_worker == -1 or decode_num_worker == -1:
                             continue
 
+                        # Recompute TTFT with combo-specific correction
+                        t_prefill = float(prefill_worker["ttft_uncorrected"])
+                        d_tpot = float(decode_worker.get("tpot", 0))
+                        d_osl = int(decode_worker.get("osl", 1))
+                        t_decode = d_tpot * max(d_osl - 1, 0)
+                        total_decode_conc = decode_bs * decode_num_worker
+                        p_bs = int(prefill_worker.get("bs", 1))
+                        combo_correction = compute_ttft_correction_factor(
+                            total_decode_conc, prefill_num_worker,
+                            t_decode_ms=t_decode, t_prefill_ms=t_prefill,
+                            prefill_bs=p_bs,
+                        )
+                        prefill_worker_corrected = dict(prefill_worker)
+                        prefill_worker_corrected["ttft"] = t_prefill * combo_correction
+
                         disagg_dict = _build_disagg_summary_dict(
-                            prefill_worker,
+                            prefill_worker_corrected,
                             prefill_num_worker,
                             decode_worker,
                             decode_num_worker,
