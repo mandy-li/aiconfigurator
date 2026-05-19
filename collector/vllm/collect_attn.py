@@ -11,7 +11,13 @@ comes from collector case specs/YAML.
 
 __compat__ = "vllm>=0.11.0"
 
+import logging
 import os
+
+# Set TRITON_ATTN as the default attention backend before vLLM is imported.
+# vLLM reads VLLM_ATTENTION_BACKEND at module-import time (cuda.py), so it
+# must be set here. setdefault means an explicit env override still wins.
+os.environ.setdefault("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
 
 import torch
 import vllm
@@ -192,6 +198,37 @@ def run_attention_torch(
     else:
         backend_name = backend_name_str
 
+    # VLLM_ATTENTION_BACKEND only filters candidates but doesn't override
+    # vLLM's internal priority order. Explicitly remap problematic backends.
+    # FLASHINFER causes AlignedAllocator workspace overflows and FP8 dtype
+    # mismatches on this device. FLASH_ATTN doesn't support fp8 KV on L40S.
+    # Force to TRITON_ATTN (or the user-requested backend if explicitly set).
+    _forced_backend = os.environ.get("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
+    if backend_name_str in ("FLASHINFER", "FLASH_ATTN") and _forced_backend != backend_name_str:
+        _preferred_candidates = [_forced_backend, "TRITON_ATTN", "FLEX_ATTENTION"]
+        for _candidate in _preferred_candidates:
+            _resolved = None
+            if AttentionBackendEnum is not None:
+                try:
+                    _resolved = AttentionBackendEnum[_candidate]
+                except Exception:
+                    pass
+            elif LegacyBackendEnum is not None:
+                if hasattr(LegacyBackendEnum, _candidate):
+                    _resolved = getattr(LegacyBackendEnum, _candidate)
+            else:
+                _resolved = _candidate
+            if _resolved is not None:
+                try:
+                    get_attention_backend(_resolved)  # verify it exists
+                    backend_name = _resolved
+                    backend_name_str = _candidate
+                    break
+                except Exception:
+                    continue
+
+    logging.info(f"Selected attention backend: {backend_name_str}")
+
     kv_cache_spec = create_standard_kv_cache_spec(vllm_config, use_fp8_kv_cache)
 
     # Ensure the KV cache has enough blocks for all sequences.
@@ -251,6 +288,13 @@ def run_attention_torch(
         # For FlashInfer default to HND layout
         kv_cache = kv_cache.transpose(2, 3).contiguous().transpose(2, 3)
         set_kv_cache_layout("HND")
+    elif backend_name_str == "TRITON_ATTN":
+        # TRITON_ATTN does kv_cache.unbind(1) expecting shape
+        # [num_blocks, 2, block_size, num_kv_heads, head_dim].
+        # create_and_prepopulate_kv_cache returns [2, num_blocks, ...] so transpose.
+        # Use a non-contiguous transpose to avoid a 16+ GiB allocation.
+        # unbind(1) works fine on non-contiguous views.
+        kv_cache = kv_cache.transpose(0, 1)
 
     # Handle special case for FLEX_ATTENTION_SLOW
     actual_backend = backend_name
