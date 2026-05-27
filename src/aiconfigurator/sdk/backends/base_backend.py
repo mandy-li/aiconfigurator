@@ -65,6 +65,9 @@ class BaseBackend:
     ACTIVATION_OVERHEAD_FRAC: float = 0.0
     OTHERS_OVERHEAD_FRAC: float = 0.0
 
+    # Legacy fixed TTFT correction factor for disagg serving.
+    _LEGACY_TTFT_CORRECTION_FACTOR: float = 1.8
+
     def __init__(self):
         # Flat dict keyed by tuple from ``_make_agg_cache_key``.
         self._agg_cache: dict = {}
@@ -1342,3 +1345,46 @@ class BaseBackend:
             "nccl": nccl_mem / one_gib,
             "others": others_mem / one_gib,
         }
+
+    # ============== Disagg queueing model (overridable by subclasses) =====
+
+    @property
+    def use_queue_model(self) -> bool:
+        """Whether this backend uses the queueing-aware TTFT correction model.
+
+        Base implementation returns ``False`` (legacy fixed-factor mode).
+        VLLMBackend overrides to check env var.
+        """
+        return False
+
+    def compute_ttft_correction_factor(
+        self,
+        decode_concurrency: int,
+        prefill_num_worker: int = 1,
+        t_decode_ms: float = 0.0,
+        t_prefill_ms: float = 0.0,
+        prefill_bs: int = 1,
+        decoder_max_concurrent: int = 0,
+    ) -> float:
+        """Compute TTFT correction factor for disagg serving.
+
+        Base implementation returns the legacy fixed factor (1.8).
+        VLLMBackend overrides with a queueing simulation.
+        """
+        return self._LEGACY_TTFT_CORRECTION_FACTOR
+
+    def compute_effective_decode_bs(
+        self,
+        decode_concurrency: int,
+        prefill_num_worker: int = 1,
+        t_decode_ms: float = 0.0,
+        t_prefill_ms: float = 0.0,
+        prefill_bs: int = 1,
+        decoder_max_concurrent: int = 0,
+    ) -> float:
+        """Compute effective decode batch size in a disagg deployment.
+
+        Base implementation returns full concurrency (no reduction).
+        VLLMBackend overrides with a queueing simulation.
+        """
+        return float(decode_concurrency)

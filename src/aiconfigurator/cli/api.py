@@ -938,6 +938,7 @@ def cli_estimate(
             prefix=prefix,
             nextn=nextn,
             nextn_accept_rates=nextn_accept_rates,
+            ctx_tokens=ctx_tokens,
         )
     else:
         raise ValueError(
@@ -1229,6 +1230,7 @@ def _run_disagg_estimate(
     prefix: int = 0,
     nextn: int = 0,
     nextn_accept_rates: list[float] | None = None,
+    ctx_tokens=None,
 ) -> EstimateResult:
     """Run disaggregated estimation."""
     from aiconfigurator.sdk.config import RuntimeConfig
@@ -1306,6 +1308,7 @@ def _run_disagg_estimate(
         decode_model_config=decode_model_config,
         decode_batch_size=decode_batch_size,
         decode_num_worker=decode_num_workers,
+        ctx_tokens=ctx_tokens,
     )
 
     if summary.check_oom():
