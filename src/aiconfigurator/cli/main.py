@@ -1854,11 +1854,17 @@ def _run_estimate_mode(args):
         raw = result.raw
         print(f"  (p) TP:           {raw.get('(p)tp', 'N/A')}")
         print(f"  (p) PP:           {raw.get('(p)pp', 'N/A')}")
-        print(f"  (p) BS:           {raw.get('(p)bs', 'N/A')}")
+        print(f"  (p) BS:           {args.prefill_batch_size}")
+        p_eff_bs = raw.get('(p)bs', 'N/A')
+        if p_eff_bs != 'N/A':
+            print(f"  (p) Effective BS: {p_eff_bs}")
         print(f"  (p) Workers:      {raw.get('(p)workers', 'N/A')}")
         print(f"  (d) TP:           {raw.get('(d)tp', 'N/A')}")
         print(f"  (d) PP:           {raw.get('(d)pp', 'N/A')}")
-        print(f"  (d) BS:           {raw.get('(d)bs', 'N/A')}")
+        print(f"  (d) BS:           {args.decode_batch_size}")
+        d_eff_bs = raw.get('(d)bs', 'N/A')
+        if d_eff_bs != 'N/A':
+            print(f"  (d) Effective BS: {d_eff_bs}")
         print(f"  (d) Workers:      {raw.get('(d)workers', 'N/A')}")
         print(f"  Total GPUs:       {raw.get('num_total_gpus', 'N/A')}")
     else:

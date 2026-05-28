@@ -1282,6 +1282,12 @@ def _simulate_prefill_queue(
     N = num_request_iters
     total_requests = C * N
 
+    # Degenerate case: no requests to simulate.
+    # This can happen when per-prefill-worker local concurrency is < 1 and
+    # callers pass ``int(lc)`` (which truncates to 0).
+    if total_requests <= 0 or C <= 0 or N <= 0:
+        return 1.0, 0.0
+
     # Ring buffer: decode_finish_times[i % C] = when request i finishes decode
     decode_finish_ring = [0.0] * C
 
