@@ -991,6 +991,19 @@ class VLLMBackend(BaseBackend):
                 op_s = chunk_tokens if is_attention else cumulative_seq_len
                 op_prefix = attn_prefix if is_attention else prefix
 
+                # Sliding-window attention: each query attends to at most
+                # ``window_size`` previous tokens, so the cached-KV cost does NOT
+                # grow once the context exceeds the window.  The shared
+                # ``query_context_attention`` models a full causal pass (cost
+                # grows quadratically with full_s), which over-charges windowed
+                # layers in later chunks.  Cap the effective prefix at the window
+                # so per-chunk cost plateaus, matching measured XPU kernels.
+                # (Scoped to the chunked-prefill path only.)
+                if is_attention:
+                    op_window = getattr(op, "_window_size", 0) or 0
+                    if op_window > 0 and op_prefix > op_window:
+                        op_prefix = op_window
+
                 result = op.query(
                     database,
                     x=x,

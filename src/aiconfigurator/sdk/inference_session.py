@@ -466,8 +466,22 @@ class DisaggInferenceSession:
         )
         # Decoder max concurrent for queueing simulation: vllm reserves
         # blocks for the full sequence (ISL + OSL), so the hard limit on
-        # concurrent sequences equals max_kv_slots.
-        decoder_max_concurrent = max_kv_slots
+        # concurrent sequences per decode worker equals max_kv_slots.
+        #
+        # The queueing simulation operates at *per-prefill-worker* scope
+        # (it is driven by lc = decode_concurrency / prefill_num_worker).
+        # The total decode capacity of the cluster is
+        # ``max_kv_slots * decode_num_worker`` (a shared pool that all
+        # prefill workers feed).  To compare against the per-prefill-worker
+        # load on the same footing, scale the cap by
+        # ``decode_num_worker / prefill_num_worker``.  Without this, the cap
+        # is evaluated at the wrong granularity whenever
+        # ``prefill_num_worker != decode_num_worker`` (e.g. 2P1D), so the KV
+        # capacity cliff is missed.
+        total_decode_capacity = max_kv_slots * max(decode_num_worker, 1)
+        decoder_max_concurrent = max(
+            1, int(total_decode_capacity // max(prefill_num_worker, 1))
+        )
         kv_capped_dbs = min(decode_batch_size, max_kv_slots)
 
         decode_runtime_config = copy.deepcopy(runtime_config)
