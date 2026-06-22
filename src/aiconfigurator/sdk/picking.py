@@ -47,6 +47,8 @@ def _build_disagg_summary_dict(
     decode_num_worker: int,
     prefill_degradation_factor: float = _RATE_MATCHING_PREFILL_DEGRADATION_FACTOR,
     decode_degradation_factor: float = _RATE_MATCHING_DECODE_DEGRADATION_FACTOR,
+    max_kv_slots: int = 0,
+    kv_capacity_exceeded: bool = False,
 ) -> dict:
     """Build a disagg summary row from independent prefill and decode dicts.
 
@@ -149,6 +151,8 @@ def _build_disagg_summary_dict(
         "(e)pp": 0,
         "(e)parallel": "",
         "(e)memory": 0.0,
+        "max_kv_slots": max_kv_slots,
+        "kv_capacity_exceeded": kv_capacity_exceeded,
         "power_w": disagg_power_avg,
     }
 

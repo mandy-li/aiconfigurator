@@ -703,6 +703,8 @@ ColumnsDisagg = [
     "(e)pp",
     "(e)parallel",
     "(e)memory",
+    "max_kv_slots",  # Maximum KV cache capacity per decode worker
+    "kv_capacity_exceeded",  # Whether decode concurrency exceeds KV capacity
     "power_w",  # NEW: E2E weighted average power in watts
 ]
 

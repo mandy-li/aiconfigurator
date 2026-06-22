@@ -1900,6 +1900,10 @@ def _run_estimate_mode(args):
         raw = result.raw
         print(f"  (p) Memory:       {raw.get('(p)memory', 'N/A')} GB")
         print(f"  (d) Memory:       {raw.get('(d)memory', 'N/A')} GB")
+        if 'max_kv_slots' in raw:
+            print(f"  max_kv_slots:     {raw['max_kv_slots']}")
+        if 'kv_capacity_exceeded' in raw:
+            print(f"  kv_capacity_exceeded: {raw['kv_capacity_exceeded']}")
     else:
         print(f"  Memory (GPU):     {result.memory:.2f} GB")
     print("=" * 60)

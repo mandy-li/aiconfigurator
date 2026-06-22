@@ -22,6 +22,34 @@ from aiconfigurator.sdk.utils import enumerate_ttft_tpot_constraints
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+# KV capacity buffer: add ~5% to the raw max_kv_slots estimate because
+# the estimate is conservative (subtracts weights/act/nccl from GPU mem @
+# 0.95 util, block-aligned). Real engines may run slightly above the
+# estimate with mild preemption. The buffer allows configs slightly over
+# the raw estimate to count as OK while flagging clearly over-capacity
+# configs that would fail or heavily preempt in production.
+_KV_CAPACITY_BUFFER = 1.05
+
+
+def _check_kv_capacity_exceeded(
+    total_decode_concurrency: int,
+    decode_num_worker: int,
+    max_kv_slots: int,
+) -> bool:
+    """Check if total decode concurrency exceeds KV capacity with buffer.
+
+    Args:
+        total_decode_concurrency: Total decode requests across all workers.
+        decode_num_worker: Number of decode workers.
+        max_kv_slots: Maximum KV cache slots per decode worker.
+
+    Returns:
+        True if capacity is exceeded, False otherwise.
+    """
+    import math
+    effective_kv_ceiling = math.ceil(max_kv_slots * _KV_CAPACITY_BUFFER)
+    return total_decode_concurrency > effective_kv_ceiling * decode_num_worker
+
 
 class InferenceSession:
     """
@@ -241,6 +269,8 @@ class DisaggInferenceSession:
         decode_num_worker: int,
         decode_concurrency_override: int | None = None,
         decoder_max_concurrent: int = 0,
+        max_kv_slots: int = 0,
+        kv_capacity_exceeded: bool = False,
     ) -> pd.DataFrame:
         """
         Get the disagg summary df based on prefill and decode summary df
@@ -277,6 +307,8 @@ class DisaggInferenceSession:
             decode_num_worker,
             prefill_degradation_factor=self._rate_matching_prefill_degradation_factor,
             decode_degradation_factor=self._rate_matching_decode_degradation_factor,
+            max_kv_slots=max_kv_slots,
+            kv_capacity_exceeded=kv_capacity_exceeded,
         )
         return pd.DataFrame([summary_dict], columns=common.ColumnsDisagg).round(3)
 
@@ -469,19 +501,14 @@ class DisaggInferenceSession:
         # concurrent sequences per decode worker equals max_kv_slots.
         #
         # The queueing simulation operates at *per-prefill-worker* scope
-        # (it is driven by lc = decode_concurrency / prefill_num_worker).
-        # The total decode capacity of the cluster is
-        # ``max_kv_slots * decode_num_worker`` (a shared pool that all
-        # prefill workers feed).  To compare against the per-prefill-worker
-        # load on the same footing, scale the cap by
-        # ``decode_num_worker / prefill_num_worker``.  Without this, the cap
-        # is evaluated at the wrong granularity whenever
-        # ``prefill_num_worker != decode_num_worker`` (e.g. 2P1D), so the KV
-        # capacity cliff is missed.
-        total_decode_capacity = max_kv_slots * max(decode_num_worker, 1)
-        decoder_max_concurrent = max(
-            1, int(total_decode_capacity // max(prefill_num_worker, 1))
-        )
+        # (it is driven by lc = decode_concurrency / prefill_num_worker), so
+        # the local decode load it sees is also per-prefill-worker.  The cap
+        # must be expressed on the SAME footing: how many decode slots back a
+        # single prefill worker's stream.  Decode capacity is a property of the
+        # DECODE workers (``max_kv_slots * decode_num_worker``); the prefill
+        # workers feed that shared pool, so per prefill worker the available
+        # decode capacity is the pool divided by ``prefill_num_worker``.
+        decoder_max_concurrent = max(1, int(max_kv_slots * max(decode_num_worker, 1)))
         kv_capped_dbs = min(decode_batch_size, max_kv_slots)
 
         decode_runtime_config = copy.deepcopy(runtime_config)
@@ -541,6 +568,12 @@ class DisaggInferenceSession:
         # the KV cap only limits how many can decode simultaneously, but all
         # requests still compete for the prefill queue.
         original_decode_concurrency = decode_batch_size * decode_num_worker
+
+        # Check if decode concurrency exceeds KV capacity with buffer.
+        kv_capacity_exceeded = _check_kv_capacity_exceeded(
+            original_decode_concurrency, decode_num_worker, max_kv_slots
+        )
+
         disagg_summary_df = self._get_disagg_summary_df(
             prefill_summary.get_summary_df(),
             prefill_num_worker,
@@ -548,6 +581,8 @@ class DisaggInferenceSession:
             decode_num_worker,
             decode_concurrency_override=original_decode_concurrency,
             decoder_max_concurrent=decoder_max_concurrent,
+            max_kv_slots=max_kv_slots,
+            kv_capacity_exceeded=kv_capacity_exceeded,
         )
 
         disagg_summary = InferenceSummary(runtime_config=runtime_config)
@@ -556,6 +591,10 @@ class DisaggInferenceSession:
         decode_oom = decode_summary.check_oom()
         if prefill_oom or decode_oom:
             disagg_summary.set_oom(True)
+
+        # Flag configs exceeding KV capacity so they are excluded from frontier.
+        if kv_capacity_exceeded:
+            disagg_summary.set_kv_cache_oom(True)
 
         disagg_summary.set_summary_df(disagg_summary_df)
 
@@ -963,6 +1002,13 @@ class DisaggInferenceSession:
                         prefill_worker_corrected = dict(prefill_worker)
                         prefill_worker_corrected["ttft"] = t_prefill * combo_correction
 
+                        # Check if this combo exceeds KV capacity and skip if so.
+                        kv_capacity_exceeded = _check_kv_capacity_exceeded(
+                            total_decode_conc, decode_num_worker, decoder_max_concurrent
+                        )
+                        if kv_capacity_exceeded:
+                            continue
+
                         disagg_dict = _build_disagg_summary_dict(
                             prefill_worker_corrected,
                             prefill_num_worker,
@@ -970,6 +1016,8 @@ class DisaggInferenceSession:
                             decode_num_worker,
                             prefill_degradation_factor=rate_matching_prefill_degradation_factor,
                             decode_degradation_factor=rate_matching_decode_degradation_factor,
+                            max_kv_slots=decoder_max_concurrent,
+                            kv_capacity_exceeded=False,  # Already filtered above
                         )
                         category_results.append(disagg_dict)
 
