@@ -146,6 +146,9 @@ def _deep_merge(target: dict, source: Mapping, *, allow_new: bool = True) -> dic
 
         if isinstance(target[key], dict) and isinstance(value, Mapping):
             _deep_merge(target[key], value, allow_new=allow_new)
+        elif isinstance(target[key], dict) and value is None:
+            # YAML key with no body parses to None; preserve defaults.
+            continue
         else:
             target[key] = copy.deepcopy(value)
     return target
@@ -1556,6 +1559,9 @@ class TaskRunner:
             )
 
         logger.info("Task %s: Running disagg pareto", task_config.task_name)
+        # ``enable_chunked_prefill`` is at task root (same place as the agg
+        # path reads it).  Defaults to False to match the agg path's convention.
+        enable_chunked_prefill = getattr(task_config, "enable_chunked_prefill", False)
         result_df = pa.disagg_pareto(
             model_path=task_config.model_path,
             runtime_config=runtime_config,
@@ -1587,6 +1593,7 @@ class TaskRunner:
             require_same_tp=require_same_tp,
             autoscale=autoscale,
             target_tpot=task_config.runtime_config.tpot if autoscale else None,
+            enable_chunked_prefill=enable_chunked_prefill,
         )
         return {"pareto_df": result_df}
 

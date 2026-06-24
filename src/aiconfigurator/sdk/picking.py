@@ -20,12 +20,13 @@ Three picking modes are supported:
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Literal
+from collections.abc import Callable
+from typing import Any, Literal
 
 import pandas as pd
 
-from aiconfigurator.sdk.backends.base_backend import BaseBackend
 from aiconfigurator.sdk import common
+from aiconfigurator.sdk.backends.base_backend import BaseBackend
 
 logger = logging.getLogger(__name__)
 

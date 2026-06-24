@@ -4,6 +4,7 @@
 import copy
 import functools
 import logging
+import math
 import warnings
 
 import pandas as pd
@@ -22,12 +23,10 @@ from aiconfigurator.sdk.utils import enumerate_ttft_tpot_constraints
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# KV capacity buffer: add ~5% to the raw max_kv_slots estimate because
-# the estimate is conservative (subtracts weights/act/nccl from GPU mem @
-# 0.95 util, block-aligned). Real engines may run slightly above the
-# estimate with mild preemption. The buffer allows configs slightly over
-# the raw estimate to count as OK while flagging clearly over-capacity
-# configs that would fail or heavily preempt in production.
+# Admit-gate slack: real engines tolerate slight preemption above the
+# conservative GPU-memory estimate. Applied ONLY in
+# ``_check_kv_capacity_exceeded``; the queueing simulator stalls at the raw
+# cap to match real engine behaviour.
 _KV_CAPACITY_BUFFER = 1.05
 
 
@@ -36,19 +35,45 @@ def _check_kv_capacity_exceeded(
     decode_num_worker: int,
     max_kv_slots: int,
 ) -> bool:
-    """Check if total decode concurrency exceeds KV capacity with buffer.
+    """Check if total decode concurrency exceeds KV cache capacity.
+
+    Applies the ``_KV_CAPACITY_BUFFER`` slack (real engines tolerate slight
+    preemption above the conservative GPU-memory estimate). Used only as the
+    boolean admit gate; the queueing simulator stalls at the raw cap.
 
     Args:
         total_decode_concurrency: Total decode requests across all workers.
         decode_num_worker: Number of decode workers.
-        max_kv_slots: Maximum KV cache slots per decode worker.
+        max_kv_slots: Raw maximum KV cache slots per decode worker.
 
     Returns:
         True if capacity is exceeded, False otherwise.
     """
-    import math
-    effective_kv_ceiling = math.ceil(max_kv_slots * _KV_CAPACITY_BUFFER)
-    return total_decode_concurrency > effective_kv_ceiling * decode_num_worker
+    ceiling = math.ceil(max_kv_slots * _KV_CAPACITY_BUFFER)
+    return total_decode_concurrency > ceiling * decode_num_worker
+
+
+def _model_config_with_parallel(base_mc: config.ModelConfig, row: dict) -> config.ModelConfig:
+    """Copy ``base_mc`` and stamp parallel dims from a candidate row.
+
+    Used before ``run_disagg`` so MoE models have ``moe_tp_size`` /
+    ``moe_ep_size`` set when ``models.get_model`` runs
+    ``resolve_moe_parallelism``.
+
+    Args:
+        base_mc: Base model config (parallel dims may be unset).
+        row: Candidate row with ``tp``, ``pp``, ``dp``, ``moe_tp``, ``moe_ep`` keys.
+
+    Returns:
+        A deep-copied ``ModelConfig`` with parallel dims stamped from ``row``.
+    """
+    mc = copy.deepcopy(base_mc)
+    mc.tp_size = int(row["tp"])
+    mc.pp_size = int(row["pp"])
+    mc.attention_dp_size = int(row["dp"])
+    mc.moe_tp_size = int(row["moe_tp"])
+    mc.moe_ep_size = int(row["moe_ep"])
+    return mc
 
 
 class InferenceSession:
@@ -231,6 +256,13 @@ class DisaggInferenceSession:
         self._rate_matching_prefill_degradation_factor = _RATE_MATCHING_PREFILL_DEGRADATION_FACTOR
         self._rate_matching_decode_degradation_factor = _RATE_MATCHING_DECODE_DEGRADATION_FACTOR
 
+        # Optional caches populated by the picker (find_best_disagg_*) to share
+        # per-(parallel, bs) static-run results across (P, D) variations of the
+        # same combo. None disables caching (default for single-point use).
+        self._static_run_cache: dict | None = None
+        self._max_kv_slots_cache: dict | None = None
+        self._chunked_prefill_cache: dict | None = None
+
     def set_latency_correction_scales(
         self,
         prefill_latency_correction_scale: float,
@@ -370,8 +402,6 @@ class DisaggInferenceSession:
             # String fallback: fp8 -> 1 byte, bf16/fp16 -> 2 bytes
             bytes_per_elem = 1 if "fp8" in str(kvcache_mode) else 2
 
-        kv_bytes_per_seq = max_seq_len * kv_elem_per_tok * bytes_per_elem
-
         # Block-aligned: round up to blocks
         blocks_per_seq = (max_seq_len + block_size - 1) // block_size
         kv_bytes_per_block = block_size * kv_elem_per_tok * bytes_per_elem
@@ -391,6 +421,7 @@ class DisaggInferenceSession:
         decode_batch_size: int,
         decode_num_worker: int,
         ctx_tokens: int | None = None,
+        enable_chunked_prefill: bool = False,
     ) -> InferenceSummary:
         """
         Run disagg with given prefill/decode worker info
@@ -410,6 +441,11 @@ class DisaggInferenceSession:
                 size is reduced to ``max(1, ctx_tokens // isl)`` to model
                 chunked-prefill behaviour where only one (or a few) requests
                 can be processed per scheduling round.
+            enable_chunked_prefill (bool): When True (and ``ctx_tokens`` is
+                not explicitly provided), default ``ctx_tokens`` to 2048
+                (vLLM's typical chunked-prefill budget). When False, skip
+                the chunked-prefill recompute. Explicit ``ctx_tokens``
+                always wins.
 
         Returns:
             InferenceSummary: the summary of the inference result
@@ -421,19 +457,64 @@ class DisaggInferenceSession:
         )
         decode_sess = InferenceSession(model=decode_model, database=self._decode_database, backend=self._decode_backend)
 
+        def _parallel_sig(mc: config.ModelConfig) -> tuple:
+            """Hashable parallel-dims signature for cache keys."""
+            return (
+                int(mc.tp_size),
+                int(mc.pp_size),
+                int(mc.attention_dp_size),
+                int(mc.moe_tp_size or 1),
+                int(mc.moe_ep_size or 1),
+            )
+
+        def _cached_static(
+            side: str,
+            sess: InferenceSession,
+            model_cfg: config.ModelConfig,
+            rt_cfg: config.RuntimeConfig,
+            mode: str,
+            scale: float,
+        ) -> InferenceSummary:
+            """Run ``sess.run_static``, memoizing on (parallel, mode, bs, ...).
+
+            The cache is enabled only when ``self._static_run_cache`` is set
+            (typically by ``find_best_disagg_result_under_constraints`` for
+            the duration of one picker call). Returns a shallow-copied
+            summary with a copied DataFrame so chunked-prefill / eff-bs
+            callers can ``set_summary_df`` without polluting the cache.
+            """
+            cache = self._static_run_cache
+            if cache is None:
+                return sess.run_static(mode=mode, runtime_config=rt_cfg, latency_correction_scale=scale)
+            key = (
+                side,
+                _parallel_sig(model_cfg),
+                mode,
+                int(rt_cfg.batch_size),
+                int(rt_cfg.isl),
+                int(rt_cfg.osl),
+                int(rt_cfg.prefix),
+                float(scale),
+            )
+            cached = cache.get(key)
+            if cached is None:
+                cached = sess.run_static(mode=mode, runtime_config=rt_cfg, latency_correction_scale=scale)
+                cache[key] = cached
+            clone = copy.copy(cached)
+            df = cached.get_summary_df()
+            if df is not None:
+                clone.set_summary_df(df.copy())
+            return clone
+
         use_queue_model = self._prefill_backend.use_queue_model
 
-        # When the queueing model is enabled and no ctx_tokens was provided,
-        # default to 2048 (typical vLLM max_num_batched_tokens for chunked prefill).
-        if use_queue_model and ctx_tokens is None:
-            ctx_tokens = 2048
+        # Honour explicit ctx_tokens; otherwise default from enable_chunked_prefill.
+        if ctx_tokens is None and use_queue_model:
+            ctx_tokens = 2048 if enable_chunked_prefill else None
 
         # Compute effective prefill batch size based on ctx_tokens budget.
         # In disagg, max_num_batched_tokens limits how many tokens the
-        # prefill engine can process per scheduling step.  When ISL is
-        # larger than ctx_tokens, only a subset of requests can be
-        # prefilled simultaneously.
-        # Only applied when the queueing model is enabled (AICONFIG_TTFT_QUEUE_MODEL=1).
+        # prefill engine can process per scheduling step.
         isl = runtime_config.isl
         effective_prefill_bs = prefill_batch_size
         if use_queue_model and ctx_tokens is not None and ctx_tokens > 0 and isl > 0:
@@ -446,10 +527,9 @@ class DisaggInferenceSession:
         # fed into the queueing simulation reflects raw silicon latency.
         # The correction (KV-transfer overhead) is applied only to the
         # final reported TTFT, not to the effective-BS calculation.
-        prefill_summary = prefill_sess.run_static(
-            mode="static_ctx",
-            runtime_config=prefill_runtime_config,
-            latency_correction_scale=1.0,
+        prefill_summary = _cached_static(
+            "prefill", prefill_sess, prefill_model_config,
+            prefill_runtime_config, "static_ctx", 1.0,
         )
 
         # When chunked prefill applies (ctx_tokens < isl), recompute the
@@ -459,12 +539,27 @@ class DisaggInferenceSession:
         # _run_chunked_context_phase is vLLM-specific (chunked prefill semantics
         # vary by backend), so only call it if the backend provides it.
         # Only applied when the queueing model is enabled (AICONFIG_TTFT_QUEUE_MODEL=1).
-        if use_queue_model and ctx_tokens is not None and ctx_tokens > 0 and ctx_tokens < isl and hasattr(self._prefill_backend, '_run_chunked_context_phase'):
-            chunked_latency_dict, _, _ = self._prefill_backend._run_chunked_context_phase(
-                prefill_model, self._prefill_database, prefill_runtime_config,
-                batch_size=effective_prefill_bs, isl=isl,
-                ctx_tokens=ctx_tokens, prefix=runtime_config.prefix,
+        if (
+            use_queue_model
+            and ctx_tokens is not None
+            and ctx_tokens > 0
+            and ctx_tokens < isl
+            and hasattr(self._prefill_backend, "_run_chunked_context_phase")
+        ):
+            chunked_cache = self._chunked_prefill_cache
+            chunked_key = (
+                _parallel_sig(prefill_model_config), int(effective_prefill_bs),
+                int(isl), int(runtime_config.prefix), int(ctx_tokens),
             )
+            chunked_latency_dict = chunked_cache.get(chunked_key) if chunked_cache is not None else None
+            if chunked_latency_dict is None:
+                chunked_latency_dict, _, _ = self._prefill_backend._run_chunked_context_phase(
+                    prefill_model, self._prefill_database, prefill_runtime_config,
+                    batch_size=effective_prefill_bs, isl=isl,
+                    ctx_tokens=ctx_tokens, prefix=runtime_config.prefix,
+                )
+                if chunked_cache is not None:
+                    chunked_cache[chunked_key] = chunked_latency_dict
             # No latency correction here -- the KV-transfer overhead
             # is applied only to the final reported TTFT.
 
@@ -472,7 +567,6 @@ class DisaggInferenceSession:
 
             # Patch the prefill summary DataFrame with corrected TTFT
             summary_df = prefill_summary.get_summary_df().copy()
-            old_ttft = float(summary_df["ttft"].iloc[0])
             summary_df["ttft"] = chunked_total_ms
             summary_df["context_latency"] = chunked_total_ms
             summary_df["request_latency"] = chunked_total_ms  # static_ctx has no gen
@@ -492,10 +586,16 @@ class DisaggInferenceSession:
             prefill_summary.set_context_latency_dict(chunked_latency_dict)
 
         # Cap decode BS at KV cache capacity before running decode.
-        max_kv_slots = self._compute_max_kv_slots(
-            decode_model, self._decode_database,
-            isl=isl, osl=runtime_config.osl,
-        )
+        kv_cache = self._max_kv_slots_cache
+        kv_key = (_parallel_sig(decode_model_config), int(isl), int(runtime_config.osl))
+        max_kv_slots = kv_cache.get(kv_key) if kv_cache is not None else None
+        if max_kv_slots is None:
+            max_kv_slots = self._compute_max_kv_slots(
+                decode_model, self._decode_database,
+                isl=isl, osl=runtime_config.osl,
+            )
+            if kv_cache is not None:
+                kv_cache[kv_key] = max_kv_slots
         # Decoder max concurrent for queueing simulation: vllm reserves
         # blocks for the full sequence (ISL + OSL), so the hard limit on
         # concurrent sequences per decode worker equals max_kv_slots.
@@ -517,10 +617,9 @@ class DisaggInferenceSession:
         # handles decode unsaturation, so skip the legacy correction scale.
         # When disabled, use the configured scale (default 1.08).
         decode_scale = 1.0 if use_queue_model else self._decode_latency_correction_scale
-        decode_summary = decode_sess.run_static(
-            mode="static_gen",
-            runtime_config=decode_runtime_config,
-            latency_correction_scale=decode_scale,
+        decode_summary = _cached_static(
+            "decode", decode_sess, decode_model_config,
+            decode_runtime_config, "static_gen", decode_scale,
         )
 
         # Compute effective decode BS: in disagg, finished-decode slots stay
@@ -550,17 +649,23 @@ class DisaggInferenceSession:
             # Effective decode BS can't exceed KV cache capacity
             eff_dbs_per_worker = min(eff_dbs_per_worker, kv_capped_dbs)
 
-            # If effective BS is meaningfully lower than KV-capped BS, re-run
-            # decode at the effective BS for more accurate TPOT.
+            # Re-run decode at eff bs for accurate TPOT; restore the requested
+            # bs on the summary so (d)bs reflects what the user deploys.
             if eff_dbs_per_worker < kv_capped_dbs * 0.95:
                 eff_dbs_rounded = max(1, round(eff_dbs_per_worker))
                 decode_runtime_eff = copy.deepcopy(runtime_config)
                 decode_runtime_eff.batch_size = eff_dbs_rounded
-                decode_summary = decode_sess.run_static(
-                    mode="static_gen",
-                    runtime_config=decode_runtime_eff,
-                    latency_correction_scale=decode_scale,
+                decode_summary = _cached_static(
+                    "decode", decode_sess, decode_model_config,
+                    decode_runtime_eff, "static_gen", decode_scale,
                 )
+                decode_summary_df = decode_summary.get_summary_df().copy()
+                decode_pp = int(decode_summary_df["pp"].iloc[0])
+                decode_dp = int(decode_summary_df["dp"].iloc[0])
+                decode_summary_df["bs"] = decode_batch_size
+                decode_summary_df["global_bs"] = decode_batch_size * decode_dp
+                decode_summary_df["concurrency"] = decode_batch_size * decode_pp * decode_dp
+                decode_summary.set_summary_df(decode_summary_df)
 
         # Use the ORIGINAL requested decode concurrency for the TTFT
         # queueing simulation, not the KV-capped/effective BS.  The benchmark
@@ -587,10 +692,12 @@ class DisaggInferenceSession:
 
         disagg_summary = InferenceSummary(runtime_config=runtime_config)
 
+        # Always set OOM (True or False) so downstream check_oom() does not
+        # warn about an unset memory status.  prefill/decode static summaries
+        # have _is_oom populated by run_static -> set_memory_and_check_oom.
         prefill_oom = prefill_summary.check_oom()
         decode_oom = decode_summary.check_oom()
-        if prefill_oom or decode_oom:
-            disagg_summary.set_oom(True)
+        disagg_summary.set_oom(bool(prefill_oom or decode_oom))
 
         # Flag configs exceeding KV capacity so they are excluded from frontier.
         if kv_capacity_exceeded:
@@ -799,6 +906,7 @@ class DisaggInferenceSession:
         require_same_tp: bool = False,
         autoscale: bool = False,
         target_tpot: float | None = None,
+        enable_chunked_prefill: bool = False,
     ) -> InferenceSummary | None:
         """
         Run disagg with given constraints
@@ -825,6 +933,9 @@ class DisaggInferenceSession:
             decode_max_num_tokens (int): the decode max num tokens
             decode_num_worker_list (List[int]): the decode num worker list
             num_gpu_list (Optional[List[int]]): the num gpu list
+            enable_chunked_prefill (bool): forwarded to ``run_disagg`` for
+                each candidate combo; when False the chunked-prefill path
+                is skipped (single-pass prefill).
 
         Returns:
             Optional[InferenceSummary]: the summary of the inference result, contains all the
@@ -838,6 +949,57 @@ class DisaggInferenceSession:
 
         # minor perf optimization: convert num_gpu_list to a set to speed up lookup
         num_gpu_set = set[int](num_gpu_list) if num_gpu_list else set()
+
+        # Enable session-level caches for the heavy primitives ``run_disagg``
+        # invokes (run_static, _compute_max_kv_slots, _run_chunked_context_phase).
+        # These share results across (P, D) variations of the same
+        # (parallel, bs) combo. Scoped to this picker call.
+        self._static_run_cache = {}
+        self._max_kv_slots_cache = {}
+        self._chunked_prefill_cache = {}
+
+        # ``run_disagg`` is deterministic in (parallel_sig, bs, num_worker,
+        # enable_chunked_prefill) for a fixed (model_path, runtime_config).
+        # The picker's outer loop iterates ~50 (ttft, tpot) constraint pairs
+        # and re-evaluates the same (P, D, p_bs, d_bs) combos; cache results
+        # so each unique combo only runs once.
+        _run_disagg_cache: dict = {}
+
+        def _cached_run_disagg(
+            p_parallel_sig: tuple,
+            p_bs: int,
+            p_workers: int,
+            d_parallel_sig: tuple,
+            d_bs: int,
+            d_workers: int,
+            chunked: bool,
+            prefill_worker: dict,
+            decode_worker: dict,
+        ) -> InferenceSummary:
+            """Memoized ``run_disagg`` call keyed on the projection inputs
+            that vary across the picker's loops. ``model_path`` and
+            ``runtime_config`` are constant across calls and excluded from
+            the key. ``prefill_worker`` / ``decode_worker`` are passed only
+            so the model configs can be rebuilt on a cache miss.
+            """
+            key = (p_parallel_sig, p_bs, p_workers, d_parallel_sig, d_bs, d_workers, chunked)
+            if key in _run_disagg_cache:
+                return _run_disagg_cache[key]
+            p_mc = _model_config_with_parallel(prefill_model_config, prefill_worker)
+            d_mc = _model_config_with_parallel(decode_model_config, decode_worker)
+            summary = self.run_disagg(
+                model_path=model_path,
+                runtime_config=runtime_config,
+                prefill_model_config=p_mc,
+                prefill_batch_size=p_bs,
+                prefill_num_worker=p_workers,
+                decode_model_config=d_mc,
+                decode_batch_size=d_bs,
+                decode_num_worker=d_workers,
+                enable_chunked_prefill=chunked,
+            )
+            _run_disagg_cache[key] = summary
+            return summary
 
         @functools.lru_cache(maxsize=8192)
         def _match_workers(
@@ -922,19 +1084,13 @@ class DisaggInferenceSession:
             #    throughput.
             #    "1.x" is an empirical value. Default is 1.1.
 
-            # only ttft will be corrected here, other latency and throughput will not be
-            # corrected. The correction depends on decode concurrency and prefill workers.
-            # With decode_bs = C and prefill_workers = P, local concurrency lc = C/P.
-            # For N waves: avg TTFT multiplier = (lc+1)/(2N) + (N-1)/N.
-            # The correction is applied per (prefill, decode) combo in the loop below
-            # since it depends on decode_bs and prefill_num_worker from rate matching.
-            # For the initial SLA filter, use no correction (correction=1)
-            # to avoid discarding prefill candidates prematurely.
-            # The actual per-combo correction is computed in the inner loop.
-            prefill_candidates = prefill_summary_df.copy()
-            prefill_candidates["ttft_uncorrected"] = prefill_candidates["ttft"]
-
-            prefill_candidates = prefill_candidates[prefill_candidates["ttft"] < ttft]
+            # SLA pre-filter: prefill rows whose single-pass static ttft is
+            # already above the constraint can be dropped.  After
+            # rate-matching, the combo will go through ``run_disagg`` which
+            # applies the queue-model TTFT correction (and chunked-prefill,
+            # eff-bs TPOT re-run, KV capacity check) -- the post-projection
+            # numbers are checked again before a combo is kept.
+            prefill_candidates = prefill_summary_df[prefill_summary_df["ttft"] < ttft].copy()
             if len(prefill_candidates) == 0:
                 logger.debug(f"No prefill worker candidates found for ttft {ttft}ms.")
                 return None
@@ -986,39 +1142,44 @@ class DisaggInferenceSession:
                         if prefill_num_worker == -1 or decode_num_worker == -1:
                             continue
 
-                        # Recompute TTFT with combo-specific correction
-                        t_prefill = float(prefill_worker["ttft_uncorrected"])
-                        d_tpot = float(decode_worker.get("tpot", 0))
-                        d_osl = int(decode_worker.get("osl", 1))
-                        t_decode = d_tpot * max(d_osl - 1, 0)
-                        total_decode_conc = decode_bs * decode_num_worker
+                        # Project this (P, D, p_bs, d_bs) combo through the
+                        # SAME pipeline ``cli estimate`` uses (run_disagg):
+                        # chunked-prefill TTFT, queueing correction (or
+                        # legacy 1.8x when the queueing model is off),
+                        # eff-bs decode TPOT re-run, KV-capacity check.
+                        p_parallel_sig = (
+                            int(prefill_worker["tp"]), int(prefill_worker["pp"]),
+                            int(prefill_worker["dp"]), int(prefill_worker["moe_tp"]),
+                            int(prefill_worker["moe_ep"]),
+                        )
+                        d_parallel_sig = (
+                            int(decode_worker["tp"]), int(decode_worker["pp"]),
+                            int(decode_worker["dp"]), int(decode_worker["moe_tp"]),
+                            int(decode_worker["moe_ep"]),
+                        )
                         p_bs = int(prefill_worker.get("bs", 1))
-                        combo_correction = self._prefill_backend.compute_ttft_correction_factor(
-                            total_decode_conc, prefill_num_worker,
-                            t_decode_ms=t_decode, t_prefill_ms=t_prefill,
-                            prefill_bs=p_bs,
-                            decoder_max_concurrent=decoder_max_concurrent,
+                        summary = _cached_run_disagg(
+                            p_parallel_sig, p_bs, prefill_num_worker,
+                            d_parallel_sig, decode_bs, decode_num_worker,
+                            enable_chunked_prefill,
+                            prefill_worker, decode_worker,
                         )
-                        prefill_worker_corrected = dict(prefill_worker)
-                        prefill_worker_corrected["ttft"] = t_prefill * combo_correction
+                        if summary.check_oom() or summary.check_kv_cache_oom():
+                            continue
+                        result_df = summary.get_summary_df()
+                        if result_df is None or result_df.empty:
+                            continue
+                        disagg_dict = result_df.iloc[0].to_dict()
 
-                        # Check if this combo exceeds KV capacity and skip if so.
-                        kv_capacity_exceeded = _check_kv_capacity_exceeded(
-                            total_decode_conc, decode_num_worker, decoder_max_concurrent
-                        )
-                        if kv_capacity_exceeded:
+                        # Re-apply SLA filter on the projected numbers --
+                        # queue-corrected TTFT can exceed the raw single-pass
+                        # value, and eff-bs TPOT can be lower than the row's
+                        # raw tpot.  The pre-filter only used raw values.
+                        if disagg_dict.get("ttft", 0.0) >= ttft:
+                            continue
+                        if disagg_dict.get("tpot", 0.0) >= tpot:
                             continue
 
-                        disagg_dict = _build_disagg_summary_dict(
-                            prefill_worker_corrected,
-                            prefill_num_worker,
-                            decode_worker,
-                            decode_num_worker,
-                            prefill_degradation_factor=rate_matching_prefill_degradation_factor,
-                            decode_degradation_factor=rate_matching_decode_degradation_factor,
-                            max_kv_slots=decoder_max_concurrent,
-                            kv_capacity_exceeded=False,  # Already filtered above
-                        )
                         category_results.append(disagg_dict)
 
                 if category_results:
@@ -1092,22 +1253,6 @@ class DisaggInferenceSession:
         if len(prefill_summary_df) == 0 or len(decode_summary_df) == 0:
             logger.debug(f"No prefill or decode workers found for {model_path} with given configs.")
             return disagg_summary
-
-        # Compute decoder max concurrent for queueing simulation.
-        # Use the first decode parallel config (KV capacity is similar
-        # across TP configs for the same model/dtype).
-        _decode_model = models.get_model(model_path, decode_model_config, self._decode_backend.name.value)
-        if decode_parallel_config_list:
-            _cfg = decode_parallel_config_list[0]
-            _decode_model.config.tp_size = _cfg[0]
-            _decode_model.config.pp_size = _cfg[1]
-            _decode_model.config.dp_size = _cfg[2]
-            _decode_model.config.moe_tp_size = _cfg[3]
-            _decode_model.config.moe_ep_size = _cfg[4]
-        decoder_max_concurrent = self._compute_max_kv_slots(
-            _decode_model, self._decode_database,
-            isl=runtime_config.isl, osl=runtime_config.osl,
-        )
 
         # ----- autoscale mode: pick P and D independently, no rate matching -----
         if autoscale:

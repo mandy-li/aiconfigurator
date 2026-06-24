@@ -309,6 +309,7 @@ def disagg_pareto(
     require_same_tp = kwargs.get("require_same_tp", False)
     autoscale = kwargs.get("autoscale", False)
     target_tpot = kwargs.get("target_tpot")
+    enable_chunked_prefill = kwargs.get("enable_chunked_prefill", False)
 
     summary = disagg_sess.find_best_disagg_result_under_constraints(
         model_path=model_path,
@@ -327,6 +328,7 @@ def disagg_pareto(
         require_same_tp=require_same_tp,
         autoscale=autoscale,
         target_tpot=target_tpot,
+        enable_chunked_prefill=enable_chunked_prefill,
     )
 
     return summary.get_summary_df()

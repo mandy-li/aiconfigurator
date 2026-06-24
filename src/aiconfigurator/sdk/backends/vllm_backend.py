@@ -33,6 +33,15 @@ _TTFT_QUEUEING_MODEL_ENV = "AICONFIG_TTFT_QUEUE_MODEL"
 _TTFT_NUM_REQUEST_ITERS_ENV = "AICONFIG_TTFT_NUM_REQUEST_ITERS"
 _TTFT_NUM_REQUEST_ITERS_DEFAULT = 10
 
+# Inflation for XPU unified-attn decode: shared kernel sized for prefill q_len.
+_UNIFIED_ATTN_DECODE_INFLATION = 4.5
+
+# Client-side prompt tokenization rate (tokens/ms); governs wave1 arrival spread.
+_CLIENT_TOKENIZE_TOKS_PER_MS = 500.0
+
+# genai-perf default: N_total = N_REQUEST_ITERS * concurrency.
+_NUM_REQUEST_ITERS = 10
+
 
 class VLLMBackend(BaseBackend):
     """vLLM backend.
@@ -334,18 +343,6 @@ class VLLMBackend(BaseBackend):
                 gen_attention_energy_wms = 0.0
                 gen_attn_source = "silicon"
                 if gen_tokens > 0:
-                    if _is_unified_attn:
-                        # On XPU (no sm_version), decode and prefill tokens share a single
-                        # flash_attn_varlen_fwd kernel call. The kernel uses a global
-                        # max_seqlen_q from the entire batch, so decode tokens (q_len=1)
-                        # run through a code path sized for the prefill's q_len (e.g. 512).
-                        # Benchmarking shows this inflates per-decode-token attention cost
-                        # by ~4.5× vs decode-only batches (where max_seqlen_q=1).
-                        # The silicon generation_attention data is collected with decode-only
-                        # batches, so we apply an inflation factor here.
-                        # TODO: replace with mixed-batch silicon data collection.
-                        _UNIFIED_ATTN_DECODE_INFLATION = 4.5
-
                     num_tokens = gen_tokens
                     summary = self.run_static(
                         model,
@@ -452,16 +449,6 @@ class VLLMBackend(BaseBackend):
             # queue behind the single-threaded prefill server.
             #
             # We simulate all N waves to capture this queuing faithfully.
-
-            # Client-side tokenization rate governs wave1 arrival spread.
-            # The benchmark client (vllm bench serve) tokenizes prompts on
-            # the CPU before sending them to the server.  At ISL=8192 this
-            # produces ~17 ms between successive request arrivals.  The rate
-            # is CPU/workload-dependent and should be tuned per test system.
-            # Set to 0 to disable (all requests arrive at t=0).
-            _CLIENT_TOKENIZE_TOKS_PER_MS = 500.0  # ~500K tokens/sec
-
-            _NUM_REQUEST_ITERS = 10  # genai-perf default: N_total = 10 * concurrency
 
             def _simulate_wave(b_reqs, isl, ctx_tokens, num_running_decode=0,
                                mix_step_ms=1.0, gen_step_ms=0.0,
@@ -649,7 +636,7 @@ class VLLMBackend(BaseBackend):
                 # Step-level simulation from wave1 end through N-1 waves.
                 # Delay = client tokenization + scheduler pipeline + HTTP.
                 # Measured as step-counts (rounded up) for the discrete sim.
-                _CLIENT_DELAY_MS = (
+                _client_delay_ms = (
                     isl / max(1, _CLIENT_TOKENIZE_TOKS_PER_MS)
                     + 50.0
                 )
@@ -660,8 +647,8 @@ class VLLMBackend(BaseBackend):
                 _sim_genonly_ms = (genonly_step_latency_ms
                                   if genonly_step_latency_ms > 0
                                   else mix_step_latency_ms)
-                _SCHED_DELAY_STEPS = max(2, int(np.ceil(
-                    _CLIENT_DELAY_MS / _sim_genonly_ms
+                _sched_delay_steps = max(2, int(np.ceil(
+                    _client_delay_ms / _sim_genonly_ms
                 ))) + 2   # +2 for scheduler pipeline ticks
 
                 _decode_remaining = [
@@ -718,7 +705,7 @@ class VLLMBackend(BaseBackend):
 
                     # Client serialization: stagger replacement arrivals
                     for _ei in range(_exits_this_step):
-                        _pending.append([_SCHED_DELAY_STEPS + _ei, _cur_time])
+                        _pending.append([_sched_delay_steps + _ei, _cur_time])
 
                     # Tick pending requests; move ready ones to wait queue
                     _new_pending = []
@@ -756,7 +743,7 @@ class VLLMBackend(BaseBackend):
                 logger.debug(
                     f"Multi-wave TTFT: wave1_mean={np.mean(wave1_ttfts):.1f} ms, "
                     f"service={_ss_service_ms:.1f} ms ({_ss_service_steps} steps), "
-                    f"sched_delay={_SCHED_DELAY_STEPS} steps, "
+                    f"sched_delay={_sched_delay_steps} steps, "
                     f"waves={_NUM_REQUEST_ITERS}"
                 )
 
@@ -771,9 +758,10 @@ class VLLMBackend(BaseBackend):
             # weighted by the number of steps a request experiences in each phase.
             _num_genonly_for_tpot = num_genonly_steps
 
-            tpot = (mix_step_latency_ms * num_mix_steps_for_tpot_calc + genonly_step_latency_ms * _num_genonly_for_tpot) / (
-                num_mix_steps_for_tpot_calc + _num_genonly_for_tpot
-            )
+            tpot = (
+                mix_step_latency_ms * num_mix_steps_for_tpot_calc
+                + genonly_step_latency_ms * _num_genonly_for_tpot
+            ) / (num_mix_steps_for_tpot_calc + _num_genonly_for_tpot)
             output_throughput = (
                 1000
                 / (num_mix_steps * mix_step_latency_ms + num_genonly_steps * genonly_step_latency_ms)
@@ -1181,10 +1169,10 @@ class VLLMBackend(BaseBackend):
         if not self.use_queue_model:
             return self._LEGACY_TTFT_CORRECTION_FACTOR
 
-        P = max(prefill_num_worker, 1)
-        B = max(prefill_bs, 1)
-        C = decode_concurrency
-        lc = C / P  # load per prefill worker
+        p_workers = max(prefill_num_worker, 1)
+        p_bs = max(prefill_bs, 1)
+        decode_conc = decode_concurrency
+        local_conc = decode_conc / p_workers  # load per prefill worker
 
         # Number of request iterations (waves) -- controls first-wave dilution.
         try:
@@ -1194,21 +1182,21 @@ class VLLMBackend(BaseBackend):
         num_request_iters = max(num_request_iters, 1)
 
         if t_prefill_ms > 0 and t_decode_ms > 0:
-            if B == 1:
+            if p_bs == 1:
                 factor, _ = _simulate_prefill_queue(
-                    int(lc), t_prefill_ms, t_decode_ms, num_request_iters,
+                    int(local_conc), t_prefill_ms, t_decode_ms, num_request_iters,
                     decoder_max_concurrent=decoder_max_concurrent,
                 )
             else:
-                R_eff = B * t_decode_ms / t_prefill_ms
-                if lc > R_eff:
-                    first_wave = (lc / B + 1) / 2
-                    steady_state = 1.0 + (lc - R_eff) / B
+                rate_eff = p_bs * t_decode_ms / t_prefill_ms
+                if local_conc > rate_eff:
+                    first_wave = (local_conc / p_bs + 1) / 2
+                    steady_state = 1.0 + (local_conc - rate_eff) / p_bs
                     factor = (first_wave + (num_request_iters - 1) * steady_state) / num_request_iters
                 else:
-                    factor = 1.15 + (lc / B - 1) / (2 * num_request_iters)
+                    factor = 1.15 + (local_conc / p_bs - 1) / (2 * num_request_iters)
         else:
-            factor = 1.1 + (lc / B - 1) / (2 * num_request_iters)
+            factor = 1.1 + (local_conc / p_bs - 1) / (2 * num_request_iters)
 
         return max(factor, 1.0)
 
@@ -1227,15 +1215,15 @@ class VLLMBackend(BaseBackend):
         replacement goes through the prefill queue.  The average decode
         occupancy is therefore lower than the configured concurrency.
         """
-        P = max(prefill_num_worker, 1)
-        B = max(prefill_bs, 1)
-        C = decode_concurrency
-        lc = C / P
+        p_workers = max(prefill_num_worker, 1)
+        p_bs = max(prefill_bs, 1)
+        decode_conc = decode_concurrency
+        local_conc = decode_conc / p_workers
 
         if t_prefill_ms <= 0 or t_decode_ms <= 0:
-            return float(C)
+            return float(decode_conc)
 
-        if B == 1:
+        if p_bs == 1:
             try:
                 num_request_iters = int(
                     os.environ.get(_TTFT_NUM_REQUEST_ITERS_ENV, _TTFT_NUM_REQUEST_ITERS_DEFAULT)
@@ -1245,16 +1233,16 @@ class VLLMBackend(BaseBackend):
             num_request_iters = max(num_request_iters, 1)
 
             _, avg_occupancy = _simulate_prefill_queue(
-                int(lc), t_prefill_ms, t_decode_ms, num_request_iters,
+                int(local_conc), t_prefill_ms, t_decode_ms, num_request_iters,
                 decoder_max_concurrent=decoder_max_concurrent,
             )
-            return avg_occupancy * P
+            return avg_occupancy * p_workers
         else:
             mean_ttft = t_prefill_ms * self.compute_ttft_correction_factor(
-                C, P, t_decode_ms, t_prefill_ms, B,
+                decode_conc, p_workers, t_decode_ms, t_prefill_ms, p_bs,
                 decoder_max_concurrent=decoder_max_concurrent,
             )
-            return C * t_decode_ms / (mean_ttft + t_decode_ms)
+            return decode_conc * t_decode_ms / (mean_ttft + t_decode_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -1291,18 +1279,17 @@ def _simulate_prefill_queue(
     """
     import heapq
 
-    C = concurrency
-    N = num_request_iters
-    total_requests = C * N
+    num_iters = num_request_iters
+    total_requests = concurrency * num_iters
 
     # Degenerate case: no requests to simulate.
     # This can happen when per-prefill-worker local concurrency is < 1 and
     # callers pass ``int(lc)`` (which truncates to 0).
-    if total_requests <= 0 or C <= 0 or N <= 0:
+    if total_requests <= 0 or concurrency <= 0 or num_iters <= 0:
         return 1.0, 0.0
 
-    # Ring buffer: decode_finish_times[i % C] = when request i finishes decode
-    decode_finish_ring = [0.0] * C
+    # Ring buffer: decode_finish_times[i % concurrency] = when request i finishes decode
+    decode_finish_ring = [0.0] * concurrency
 
     prefill_free_at = 0.0
     total_ttft = 0.0
@@ -1313,17 +1300,17 @@ def _simulate_prefill_queue(
     total_decode_time = 0.0  # sum of decode durations across all requests
 
     # Decoder capacity: limits how many requests can decode simultaneously.
-    use_decoder_cap = decoder_max_concurrent > 0 and decoder_max_concurrent < C
+    use_decoder_cap = decoder_max_concurrent > 0 and decoder_max_concurrent < concurrency
     if use_decoder_cap:
         # Priority queue of times when decoder slots become free.
         decoder_slots: list[float] = [0.0] * decoder_max_concurrent
         heapq.heapify(decoder_slots)
 
     for i in range(total_requests):
-        if i < C:
+        if i < concurrency:
             arrive = 0.0
         else:
-            arrive = decode_finish_ring[i % C]
+            arrive = decode_finish_ring[i % concurrency]
 
         prefill_start = max(arrive, prefill_free_at)
         prefill_end = prefill_start + t_prefill_ms
@@ -1341,7 +1328,7 @@ def _simulate_prefill_queue(
         total_ttft += ttft
 
         decode_finish = decode_start + t_decode_ms
-        decode_finish_ring[i % C] = decode_finish
+        decode_finish_ring[i % concurrency] = decode_finish
         total_decode_time += t_decode_ms
 
         if use_decoder_cap:
@@ -1352,6 +1339,6 @@ def _simulate_prefill_queue(
 
     # Average decode occupancy = total decode-seconds / wall-clock time
     wall_time = max(decode_finish_ring)
-    avg_decode_occupancy = total_decode_time / wall_time if wall_time > 0 else float(C)
+    avg_decode_occupancy = total_decode_time / wall_time if wall_time > 0 else float(concurrency)
 
     return ttft_factor, avg_decode_occupancy
