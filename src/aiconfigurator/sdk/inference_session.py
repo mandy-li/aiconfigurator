@@ -323,6 +323,7 @@ class DisaggInferenceSession:
             t_decode_ms=t_decode, t_prefill_ms=t_prefill,
             prefill_bs=prefill_bs,
             decoder_max_concurrent=decoder_max_concurrent,
+            decode_num_worker=decode_num_worker,
         )
         # Apply queueing correction, then add the KV-transfer overhead
         # (prefill_latency_correction_scale).  The correction scale is NOT

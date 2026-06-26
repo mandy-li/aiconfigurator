@@ -1157,6 +1157,7 @@ class VLLMBackend(BaseBackend):
         t_prefill_ms: float = 0.0,
         prefill_bs: int = 1,
         decoder_max_concurrent: int = 0,
+        decode_num_worker: int = 1,
     ) -> float:
         """Compute TTFT correction factor using vLLM queueing model.
 
@@ -1170,9 +1171,12 @@ class VLLMBackend(BaseBackend):
             return self._LEGACY_TTFT_CORRECTION_FACTOR
 
         p_workers = max(prefill_num_worker, 1)
+        d_workers = max(decode_num_worker, 1)
         p_bs = max(prefill_bs, 1)
-        decode_conc = decode_concurrency
-        local_conc = decode_conc / p_workers  # load per prefill worker
+        # Prefill-queue load is per (prefill-worker, decode-worker) pipeline:
+        # extra decode workers add parallel decode-slot drain, not extra
+        # standing load on a single prefill worker, so divide them out.
+        local_conc = decode_concurrency / d_workers / p_workers
 
         # Number of request iterations (waves) -- controls first-wave dilution.
         try:
