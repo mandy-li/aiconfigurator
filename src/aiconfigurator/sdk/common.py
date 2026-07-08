@@ -489,6 +489,7 @@ SupportedSystems = {
     "l4",
     "l40s",
     "b60",
+    "b70",
     "rtx_pro_6000_server",
 }
 

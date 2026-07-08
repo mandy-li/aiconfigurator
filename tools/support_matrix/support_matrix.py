@@ -66,7 +66,9 @@ _FRONTIER_ENVELOPE_COLUMNS = {
 }
 _FP8_QUANT_MODE_NAMES = frozenset({"fp8", "fp8_static", "fp8_block", "w4afp8"})
 _NATIVE_FP4_QUANT_MODE_NAMES = frozenset({"nvfp4"})
-_FP8_SOFTWARE_FALLBACK_SYSTEMS = frozenset({"b60"})
+# Intel Arc XPU systems run FP8 model paths by converting FP8 weights to BF16 at runtime.
+# Do not model these as native FP8 throughput (no fp8_tc_flops in their system YAMLs).
+_FP8_SOFTWARE_FALLBACK_SYSTEMS = frozenset({"b60", "b70"})
 
 
 def _combination_sort_key(combo: tuple[str, str, str, str]) -> tuple[str, str, str, str]:

@@ -216,7 +216,7 @@ def create_charts(
         "dsa_generation_module": [validate_database.visualize_dsa_module],
     }
 
-    xpu_systems = ["b60"]
+    xpu_systems = ["b60", "b70"]
     if system in xpu_systems:
         op_to_chart_function["generation_attention"] = [
             fn

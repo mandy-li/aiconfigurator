@@ -57,6 +57,30 @@ def test_fp8_model_is_allowed_for_b60_software_fallback_without_native_fp8_flops
     assert incompatibility is None
 
 
+def test_fp8_model_is_allowed_for_b70_software_fallback_without_native_fp8_flops():
+    incompatibility = get_hardware_incompatibility(
+        model="nvidia/Llama-3.1-70B-Instruct-FP8",
+        system="b70",
+        backend="vllm",
+        system_spec={"gpu": {"bfloat16_tc_flops": 1}},
+    )
+
+    assert incompatibility is None
+
+
+def test_fp4_model_is_hardware_incompatible_for_b70_without_fp4_support():
+    incompatibility = get_hardware_incompatibility(
+        model="nvidia/Qwen3-235B-A22B-NVFP4",
+        system="b70",
+        backend="vllm",
+        system_spec={"gpu": {"bfloat16_tc_flops": 1}},
+    )
+
+    assert incompatibility is not None
+    assert incompatibility.missing_datatypes == ("FP4",)
+    assert "does not support FP4" in incompatibility.reason
+
+
 def test_fp4_model_is_hardware_incompatible_without_fp4_support():
     incompatibility = get_hardware_incompatibility(
         model="nvidia/Qwen3-235B-A22B-NVFP4",

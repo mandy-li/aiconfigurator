@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+data_dir: data/b70 # relative to systems_dir
+gpu:
+  mem_bw: 608000000000 # 608 GB/s (256-bit bus, GDDR6)
+  mem_bw_empirical_scaling_factor: 0.5 # TODO: update after collecting empirical data on B70 (use B60 ratio as placeholder)
+  mem_empirical_constant_latency: 0.000003 # 3us placeholder; adjust based on B70 observations
+  mem_capacity: 34359738368 # 32 GiB
+  float32_tc_flops: 22940000000000 # 22.94 TFLOPS
+  bfloat16_tc_flops: 183520000000000 # 183.5 TFLOPS — Intel spec does not publish BF16 directly; derived from 8x float32 ratio (same as B60). Verify when Intel publishes official BF16 figure.
+  int8_tc_flops: 367000000000000 # 367 TOPS — official Intel spec (GPU Peak TOPS Int8)
+  power: 230 # Watt (Total Board Power)
+
+node:
+  num_gpus_per_node: 8 # check your card count with sycl-ls
+  inter_node_bw: 50000000000 # Byte/s per GPU, single direction, 1:1 CX7 per node, 50 GB/s (same fabric as B60)
+  intra_node_bw: 64000000000 # Byte/s per GPU, single direction, PCIe 5.0 x16 (16-lane, vs 8-lane on B60)
+  pcie_bw: 64000000000 # Byte/s, single direction, PCIe 5.0 x16
+  p2p_latency: 0.00001 # 10us placeholder; adjust based on B70 observations
+
+# TODO: update nccl_mem after collecting oneCCL data on B70.
+# Using B60 values as a conservative placeholder until B70-specific measurements are available.
+misc:
+  nccl_mem:
+    1: 0
+    2: 358612992 # 342 MB (B60 placeholder)
+    4: 411041792 # 392 MB (B60 placeholder)
+    8: 411041792 # 392 MB (B60 placeholder)
+  other_mem: 3758096384 # 3.5 GB placeholder; covers inaccurate mem calc conservatively
+  nccl_version: '2.23'
+  oneccl_version: '2021.17.2'

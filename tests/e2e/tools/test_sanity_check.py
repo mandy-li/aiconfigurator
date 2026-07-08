@@ -22,7 +22,7 @@ def _supported_system_backend_latest():
     supported = get_supported_databases()
     result = []
     for system, backends in sorted(supported.items()):
-        fail_ok = system in ["b60"]  # xpu
+        fail_ok = system in ["b60", "b70"]  # xpu
         for backend in sorted(backends.keys()):
             version = get_latest_database_version(system, backend)
             if version is not None:
