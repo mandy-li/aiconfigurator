@@ -63,6 +63,21 @@ from vllm.distributed import init_distributed_environment
 from vllm.distributed.parallel_state import ensure_model_parallel_initialized
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.version import __version__ as VLLM_VERSION
+
+# Parse vLLM version tuple for comparison (e.g., "0.24.0" -> (0, 24, 0))
+def _parse_vllm_version(version_str: str) -> tuple:
+    """Parse vLLM version string into tuple of ints for comparison."""
+    import re
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", version_str)
+    if match:
+        return tuple(int(x) for x in match.groups())
+    return (0, 0, 0)
+
+_VLLM_VERSION_TUPLE = _parse_vllm_version(VLLM_VERSION)
+# vLLM 0.24+ changed KV cache layout from (2, num_blocks, ...) to (num_blocks, 2, ...)
+# for XPU and other backends (unbind moved from dim 0 to dim 1)
+_VLLM_KV_CACHE_LAYOUT_NEW = _VLLM_VERSION_TUPLE >= (0, 24, 0)
 
 _COMMON_ATTN_METADATA_PARAMS = set(inspect.signature(CommonAttentionMetadata).parameters)
 
@@ -489,13 +504,16 @@ def create_and_prepopulate_kv_cache_mla(
 
     # Construct the right block table
     # Start from block_id=1 since block_id=0 is considered the null block
+    # NOTE: Use context_lens (not seq_lens) because only context tokens are
+    # prepopulated into KV cache blocks. Query tokens use separate allocation.
     start_block_idx = 1
     for i in range(batch_size):
-        num_blocks_for_seq = cdiv(int(seq_lens[i]), block_size)
+        num_context_tokens = int(context_lens[i])
+        num_blocks_for_seq = cdiv(num_context_tokens, block_size)
         start = start_block_idx
-        end = start + num_blocks_for_seq
+        end = start_block_idx + num_blocks_for_seq
         block_table[i, :num_blocks_for_seq] = inv_perm[start:end]
-        start_block_idx += num_blocks_for_seq
+        start_block_idx = end
 
         # Create a realistic slot mapping that corresponds to the block table
     for i in range(batch_size):
@@ -547,22 +565,44 @@ def create_and_prepopulate_kv_cache(
     block_table = common_attn_metadata.block_table_tensor
     slot_mapping = common_attn_metadata.slot_mapping
 
-    # Create KV cache
-    kv_cache = torch.empty(2, num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device=device)
-    kv_cache_flat = kv_cache.view(2, -1, num_kv_heads, head_size)
+    # Create KV cache with appropriate K,V layout for the vLLM version:
+    # vLLM >= 0.24: (num_blocks, 2, block_size, num_kv_heads, head_size) — K,V at dim 1
+    #               so kv_cache.unbind(1) -> [key_cache, value_cache]
+    # vLLM <  0.24: (2, num_blocks, block_size, num_kv_heads, head_size) — K,V at dim 0
+    #               so kv_cache.unbind(0) -> [key_cache, value_cache]
+    if _VLLM_KV_CACHE_LAYOUT_NEW:
+        kv_cache = torch.empty(num_blocks, 2, block_size, num_kv_heads, head_size, dtype=dtype, device=device)
+    else:
+        kv_cache = torch.empty(2, num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device=device)
 
     # Populate the cache with the context tokens
     # Start from block_id=1 since block_id=0 is considered the null block
     start_block_idx = 1
     for i in range(batch_size):
         k_context, v_context = k_contexts[i], v_contexts[i]
-        start = start_block_idx * block_size
-        end = start + k_context.shape[0]
-        kv_cache_flat[0, start:end, ...] = k_context
-        kv_cache_flat[1, start:end, ...] = v_context
+        num_context_tokens = k_context.shape[0]
+        num_blocks_for_seq = cdiv(num_context_tokens, block_size)
+        end_block_idx = start_block_idx + num_blocks_for_seq
+
+        if _VLLM_KV_CACHE_LAYOUT_NEW:
+            # New layout: (num_blocks, 2, block_size, num_kv_heads, head_size)
+            # dim 1 index 0 = K, index 1 = V
+            for block_idx in range(start_block_idx, end_block_idx):
+                slot_base = (block_idx - start_block_idx) * block_size
+                slot_len = min(block_size, num_context_tokens - slot_base)
+                kv_cache[block_idx, 0, :slot_len, :, :] = k_context[slot_base:slot_base + slot_len]
+                kv_cache[block_idx, 1, :slot_len, :, :] = v_context[slot_base:slot_base + slot_len]
+        else:
+            # Old layout: (2, num_blocks, block_size, num_kv_heads, head_size)
+            # dim 0 index 0 = K, index 1 = V
+            kv_cache_flat = kv_cache.view(2, -1, num_kv_heads, head_size)
+            start = start_block_idx * block_size
+            end = start + num_context_tokens
+            kv_cache_flat[0, start:end, ...] = k_context
+            kv_cache_flat[1, start:end, ...] = v_context
 
         # Stay block aligned and allocate enough blocks for the new tokens
-        start_block_idx += cdiv(int(seq_lens[i]), block_size)
+        start_block_idx = end_block_idx
 
     blocks_end = start_block_idx
 
@@ -585,20 +625,23 @@ def create_and_prepopulate_kv_cache(
     # permutation, and then cast it back to the original FP8 format.
     if "xpu" in str(device) and kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         temp_cache = kv_cache.to(torch.bfloat16)
-        temp_cache_sliced = temp_cache[:, perm, ...]
-        kv_cache[:, 1:blocks_end, ...] = temp_cache_sliced.to(kv_cache.dtype)
+        temp_cache_sliced = temp_cache[perm, ...]
+        kv_cache[1:blocks_end, ...] = temp_cache_sliced.to(kv_cache.dtype)
     else:
-        kv_cache[:, 1:blocks_end, ...] = kv_cache[:, perm, ...]
+        kv_cache[1:blocks_end, ...] = kv_cache[perm, ...]
 
     # Construct the right block table
     # Start from block_id=1 since block_id=0 is considered the null block
+    # NOTE: Use context_lens (not seq_lens) because only context tokens are
+    # prepopulated into KV cache blocks. Query tokens use separate allocation.
     start_block_idx = 1
     for i in range(batch_size):
-        num_blocks_for_seq = cdiv(int(seq_lens[i]), block_size)
+        num_context_tokens = int(context_lens[i])
+        num_blocks_for_seq = cdiv(num_context_tokens, block_size)
         start = start_block_idx
-        end = start + num_blocks_for_seq
+        end = start_block_idx + num_blocks_for_seq
         block_table[i, :num_blocks_for_seq] = inv_perm[start:end]
-        start_block_idx += num_blocks_for_seq
+        start_block_idx = end
 
         # Create a realistic slot mapping that corresponds to the block table
     for i in range(batch_size):

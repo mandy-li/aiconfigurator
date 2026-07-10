@@ -14,8 +14,17 @@ import os
 
 import torch
 import torch.nn.functional as F
-from vllm.model_executor.layers.fused_moe.layer import determine_expert_map
 from vllm.version import __version__ as vllm_version
+
+try:
+    from vllm.model_executor.layers.fused_moe.layer import determine_expert_map
+except ImportError:
+    # vLLM 0.24+ removed determine_expert_map; provide a simple fallback
+    def determine_expert_map(moe_ep_size, rank, num_experts):
+        """Fallback for vLLM 0.24+ where this function was removed."""
+        local_num_experts = num_experts // moe_ep_size
+        expert_map = {i: i * moe_ep_size + rank for i in range(local_num_experts)}
+        return local_num_experts, expert_map, 0
 
 from collector.case_generator import (
     get_moe_backend_model_activation,
