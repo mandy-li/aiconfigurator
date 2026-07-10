@@ -18,6 +18,7 @@ All other functions are pure.
 
 from __future__ import annotations
 
+import bisect
 import logging
 import math
 
@@ -42,6 +43,24 @@ def get_value(data_value, metric: str = "latency"):
 
 def validate_interpolation_result(value):
     """Validate that an interpolated value is finite; log a debug line if negative."""
+
+    # Fast path: a plain Python float/int scalar. ``bilinear_interpolation``
+    # and ``interp_1d`` return such scalars, and they are the overwhelmingly
+    # common callers on the per-step attention sweep. ``math.isfinite`` avoids
+    # the ``np.asarray`` + ``np.all`` overhead that ran millions of times.
+    # (``np.float64`` is a subclass of ``float`` so it takes this path too.)
+    #
+    # The ``griddata`` callers (``interp_2d_linear`` linear branch,
+    # ``interp_3d_linear``, and the ``method="cubic"`` branch of
+    # ``interp_2d_1d``) return a 0-d ``ndarray`` instead, which is NOT an
+    # ``int``/``float`` -- those fall through to the numpy branch below.
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            raise ValueError(f"Non-finite value detected {value}")
+        if value < 0.0:
+            logger.debug(f"Negative value detected {value}, pass")
+        return value
+
     value_array = np.asarray(value)
     if not np.all(np.isfinite(value_array)):
         raise ValueError(f"Non-finite value detected {value}")
@@ -106,13 +125,14 @@ def nearest_1d_point_helper(x: int, values: list[int], inner_only: bool = True) 
             raise ValueError(f"x is greater than the largest value in the list. {x=}, {sorted_values=}")
         return sorted_values[-2], sorted_values[-1]
 
-    start = end = None
-    for i, value in enumerate(sorted_values):
-        if x >= value and i != len(sorted_values) - 1:
-            continue
-        end = value
-        start = sorted_values[i - 1]
-        break
+    # Bracket ``x`` with the first grid point strictly greater than it and
+    # that point's predecessor. This is equivalent to the previous linear
+    # scan but uses ``bisect`` (O(log n) instead of O(n)); the helper runs
+    # millions of times inside the per-step attention sweep.
+    end_idx = bisect.bisect_right(sorted_values, x)
+    if end_idx >= len(sorted_values):  # x == max: pair the last two points
+        end_idx = len(sorted_values) - 1
+    start, end = sorted_values[end_idx - 1], sorted_values[end_idx]
     if start is None or end is None:
         raise ValueError(f"start or end is None. {x=}, {sorted_values=}, start={start=}, end={end=}")
     return start, end

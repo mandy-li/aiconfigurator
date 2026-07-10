@@ -521,19 +521,26 @@ def _discover_database_refs(systems_paths: list[str]) -> list[DatabaseRef]:
 
 
 def _finalize_loaded_value(value):
+    # Keys are never recursed into: dict keys are always hashable scalars
+    # (enum / int / str / tuple-of-scalars), and a defaultdict is unhashable,
+    # so a key can never itself be a loader defaultdict. Recursing over keys
+    # roughly doubled the traversal of the (very large) nested perf tables at
+    # load time for no effect.
+    value_type = type(value)
+    if value_type is dict or value_type is defaultdict:
+        return {key: _finalize_loaded_value(item) for key, item in value.items()}
+    if value_type is tuple:
+        return tuple(_finalize_loaded_value(item) for item in value)
+    if value_type is list:
+        return [_finalize_loaded_value(item) for item in value]
     if isinstance(value, SystemSpec):
         return value
     if isinstance(value, LoadedOpData):
         value.data = _finalize_loaded_value(value.data)
         return value
-    if isinstance(value, defaultdict):
-        return {_finalize_loaded_value(key): _finalize_loaded_value(item) for key, item in value.items()}
+    # dict / defaultdict subclasses (other than plain defaultdict) fall here.
     if isinstance(value, dict):
-        return {_finalize_loaded_value(key): _finalize_loaded_value(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return tuple(_finalize_loaded_value(item) for item in value)
-    if isinstance(value, list):
-        return [_finalize_loaded_value(item) for item in value]
+        return {key: _finalize_loaded_value(item) for key, item in value.items()}
     return value
 
 

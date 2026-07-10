@@ -30,6 +30,25 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 _KV_CAPACITY_BUFFER = 1.05
 
 
+def _build_disagg_summary_frame(rows: list[dict] | dict) -> pd.DataFrame:
+    """Build a rounded disagg-summary DataFrame with object-dtype strings.
+
+    pandas 3.0 defaults to pyarrow-backed string columns
+    (``future.infer_string=True``), whose per-frame construction cost is
+    ~2x object dtype. This frame is built ~10k+ times inside the disagg
+    picker, where the string columns are only ever read back via
+    ``iloc[0].to_dict()``; the extracted Python values (and numeric
+    ``float64`` columns) are identical either way, so forcing object dtype
+    here is transparent to callers and materially cheaper.
+
+    Accepts a single row dict or a list of row dicts.
+    """
+    if isinstance(rows, dict):
+        rows = [rows]
+    with pd.option_context("future.infer_string", False):
+        return pd.DataFrame(rows, columns=common.ColumnsDisagg).round(3)
+
+
 def _check_kv_capacity_exceeded(
     total_decode_concurrency: int,
     decode_num_worker: int,
@@ -343,7 +362,7 @@ class DisaggInferenceSession:
             max_kv_slots=max_kv_slots,
             kv_capacity_exceeded=kv_capacity_exceeded,
         )
-        return pd.DataFrame([summary_dict], columns=common.ColumnsDisagg).round(3)
+        return _build_disagg_summary_frame(summary_dict)
 
     def _compute_max_kv_slots(
         self,
@@ -522,7 +541,10 @@ class DisaggInferenceSession:
             max_concurrent = max(1, ctx_tokens // isl)
             effective_prefill_bs = min(prefill_batch_size, max_concurrent)
 
-        prefill_runtime_config = copy.deepcopy(runtime_config)
+        # Shallow copy: RuntimeConfig holds only scalars and we merely rebind
+        # ``batch_size`` below (never mutate a shared object in place), so a
+        # deepcopy is unnecessary here on this hot path.
+        prefill_runtime_config = copy.copy(runtime_config)
         prefill_runtime_config.batch_size = effective_prefill_bs
         # Run prefill WITHOUT the correction scale so that t_prefill
         # fed into the queueing simulation reflects raw silicon latency.
@@ -612,7 +634,7 @@ class DisaggInferenceSession:
         decoder_max_concurrent = max(1, int(max_kv_slots * max(decode_num_worker, 1)))
         kv_capped_dbs = min(decode_batch_size, max_kv_slots)
 
-        decode_runtime_config = copy.deepcopy(runtime_config)
+        decode_runtime_config = copy.copy(runtime_config)  # scalars only; see prefill copy above
         decode_runtime_config.batch_size = kv_capped_dbs
         # When queueing model is enabled, the effective-BS re-run below
         # handles decode unsaturation, so skip the legacy correction scale.
@@ -654,7 +676,7 @@ class DisaggInferenceSession:
             # bs on the summary so (d)bs reflects what the user deploys.
             if eff_dbs_per_worker < kv_capped_dbs * 0.95:
                 eff_dbs_rounded = max(1, round(eff_dbs_per_worker))
-                decode_runtime_eff = copy.deepcopy(runtime_config)
+                decode_runtime_eff = copy.copy(runtime_config)  # scalars only; see prefill copy above
                 decode_runtime_eff.batch_size = eff_dbs_rounded
                 decode_summary = _cached_static(
                     "decode", decode_sess, decode_model_config,
@@ -976,16 +998,25 @@ class DisaggInferenceSession:
             chunked: bool,
             prefill_worker: dict,
             decode_worker: dict,
-        ) -> InferenceSummary:
+        ) -> tuple[InferenceSummary, dict | None]:
             """Memoized ``run_disagg`` call keyed on the projection inputs
             that vary across the picker's loops. ``model_path`` and
             ``runtime_config`` are constant across calls and excluded from
             the key. ``prefill_worker`` / ``decode_worker`` are passed only
             so the model configs can be rebuilt on a cache miss.
+
+            Returns the summary together with its single-row summary_df
+            already materialised as a plain dict. The picker's outer loop
+            iterates ~50 (ttft, tpot) constraint pairs and re-visits the same
+            (P, D, p_bs, d_bs) combos; extracting the row (``iloc[0].to_dict``)
+            on a pandas frame backed by pyarrow string columns is expensive,
+            so cache the dict alongside the summary and hand back the same
+            object on repeat hits.
             """
             key = (p_parallel_sig, p_bs, p_workers, d_parallel_sig, d_bs, d_workers, chunked)
-            if key in _run_disagg_cache:
-                return _run_disagg_cache[key]
+            cached = _run_disagg_cache.get(key)
+            if cached is not None:
+                return cached
             p_mc = _model_config_with_parallel(prefill_model_config, prefill_worker)
             d_mc = _model_config_with_parallel(decode_model_config, decode_worker)
             summary = self.run_disagg(
@@ -999,8 +1030,14 @@ class DisaggInferenceSession:
                 decode_num_worker=d_workers,
                 enable_chunked_prefill=chunked,
             )
-            _run_disagg_cache[key] = summary
-            return summary
+            result_df = summary.get_summary_df()
+            if result_df is None or result_df.empty:
+                row_dict = None
+            else:
+                row_dict = result_df.iloc[0].to_dict()
+            cached = (summary, row_dict)
+            _run_disagg_cache[key] = cached
+            return cached
 
         @functools.lru_cache(maxsize=8192)
         def _match_workers(
@@ -1159,7 +1196,7 @@ class DisaggInferenceSession:
                             int(decode_worker["moe_ep"]),
                         )
                         p_bs = int(prefill_worker.get("bs", 1))
-                        summary = _cached_run_disagg(
+                        summary, disagg_dict = _cached_run_disagg(
                             p_parallel_sig, p_bs, prefill_num_worker,
                             d_parallel_sig, decode_bs, decode_num_worker,
                             enable_chunked_prefill,
@@ -1167,10 +1204,8 @@ class DisaggInferenceSession:
                         )
                         if summary.check_oom() or summary.check_kv_cache_oom():
                             continue
-                        result_df = summary.get_summary_df()
-                        if result_df is None or result_df.empty:
+                        if disagg_dict is None:
                             continue
-                        disagg_dict = result_df.iloc[0].to_dict()
 
                         # Re-apply SLA filter on the projected numbers --
                         # queue-corrected TTFT can exceed the raw single-pass
@@ -1194,7 +1229,7 @@ class DisaggInferenceSession:
                 logger.debug("No disagg summary found after applying constraints.")
                 return None
 
-            disagg_summary_df = pd.DataFrame(all_category_results, columns=common.ColumnsDisagg).round(3)
+            disagg_summary_df = _build_disagg_summary_frame(all_category_results)
             disagg_summary_df = (
                 disagg_summary_df.sort_values(by=["tokens/s/gpu"], ascending=[False])
                 .head(return_top_k)
