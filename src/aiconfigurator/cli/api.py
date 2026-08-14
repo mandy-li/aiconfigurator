@@ -1514,7 +1514,7 @@ def _run_agg_estimate(
 
     model = get_model(model_path, model_config, backend_name)
     database = load_database(system_name)
-    backend = get_backend(backend_name)
+    backend = get_backend(backend_name, system_name)
     session = InferenceSession(model, database, backend)
     speculative_profile = SpeculativeDecodingProfile.from_inputs(nextn, nextn_accepted)
     summary = session.run_agg(
@@ -1661,7 +1661,7 @@ def _run_static_estimate(
 
     model = get_model(model_path, model_config, backend_name)
     database = load_database(system_name)
-    backend = get_backend(backend_name)
+    backend = get_backend(backend_name, system_name)
     session = InferenceSession(model, database, backend)
     summary = session.run_static(
         runtime_config=runtime_config,
